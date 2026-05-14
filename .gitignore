@@ -1,0 +1,9 @@
+.env
+.idea/
+__pycache__/
+*.pyc
+venv/
+
+gemini_audit.jsonl
+game_queue.json
+global_history.json
