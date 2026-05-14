@@ -35,6 +35,26 @@ The service expects:
 - environment file: `/home/ubuntu/alive-or-dead/.env`
 - app base path: `APP_BASE_PATH=/alive-or-dead`
 
+## GitHub Actions deploy
+
+The repository includes a production deploy workflow at `.github/workflows/deploy.yml`.
+It triggers on pushes to `main` and on manual `workflow_dispatch`.
+
+Required repository secrets:
+
+- `DEPLOY_HOST`: `52.24.151.9`
+- `DEPLOY_USER`: `ubuntu`
+- `DEPLOY_SSH_KEY`: the private SSH key used to reach the EC2 host
+
+The workflow:
+
+1. checks out the repo
+2. runs `python -m py_compile main.py`
+3. syncs the repo to `/home/ubuntu/alive-or-dead` with `rsync`
+4. runs `deploy/remote_deploy.sh` on the server
+
+`deploy/rsync-excludes.txt` defines the files that are intentionally not deployed, including `.env`, local queues/history, audit logs, editor metadata, and the local virtualenv.
+
 ## Gemini Audit Log
 
 - Gemini prompt/response audit events are written to `gemini_audit.jsonl` in the project root by default.
