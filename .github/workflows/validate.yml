@@ -1,0 +1,26 @@
+name: Validate
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify application syntax
+        run: python -m py_compile main.py
+
+      - name: Verify deploy script syntax
+        run: bash -n deploy/remote_deploy.sh

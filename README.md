@@ -40,6 +40,10 @@ The service expects:
 The repository includes a production deploy workflow at `.github/workflows/deploy.yml`.
 It triggers on pushes to `main` and on manual `workflow_dispatch`.
 
+The repository also includes a validation workflow at `.github/workflows/validate.yml`.
+It runs on pull requests targeting `main` and is intended to be the required
+status check for branch protection.
+
 Required repository secrets:
 
 - `DEPLOY_HOST`: `52.24.151.9`
