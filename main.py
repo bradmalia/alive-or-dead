@@ -49,6 +49,11 @@ if legacy_genai and api_key:
 
 BASE_DIR = Path(__file__).resolve().parent
 IP_HISTORY_FILE = BASE_DIR / "ip_history.json"
+CANDIDATE_BANK_FILE = Path(
+    os.getenv("CANDIDATE_BANK_FILE", str(BASE_DIR / "candidate_bank.json"))
+).expanduser()
+if not CANDIDATE_BANK_FILE.is_absolute():
+    CANDIDATE_BANK_FILE = (BASE_DIR / CANDIDATE_BANK_FILE).resolve()
 PORTRAIT_RESOLUTION_CACHE_FILE = Path(
     os.getenv(
         "PORTRAIT_RESOLUTION_CACHE_FILE",
@@ -85,6 +90,10 @@ SESSION_APPROVED_POOL_SIZE = int(
 SESSION_CANDIDATE_TARGET_COUNT = int(
     os.getenv("SESSION_CANDIDATE_TARGET_COUNT", "30")
 )
+CANDIDATE_BANK_MAX_ENTRIES = int(os.getenv("CANDIDATE_BANK_MAX_ENTRIES", "400"))
+CANDIDATE_BANK_TTL_SECONDS = int(
+    os.getenv("CANDIDATE_BANK_TTL_SECONDS", str(7 * 24 * 60 * 60))
+)
 IP_HISTORY_MAX_NAMES = int(os.getenv("IP_HISTORY_MAX_NAMES", "1000"))
 SESSION_NEGOTIATION_ATTEMPTS = int(os.getenv("SESSION_NEGOTIATION_ATTEMPTS", "3"))
 ROUND_UI_TEMPERATURE = float(os.getenv("ROUND_UI_TEMPERATURE", "0.65"))
@@ -111,6 +120,9 @@ IMAGE_URL_VALIDATION_TIMEOUT_SECONDS = float(
 WIKIMEDIA_429_RETRY_COUNT = int(os.getenv("WIKIMEDIA_429_RETRY_COUNT", "2"))
 WIKIMEDIA_429_RETRY_BACKOFF_MS = float(
     os.getenv("WIKIMEDIA_429_RETRY_BACKOFF_MS", "350")
+)
+WIKIMEDIA_MIN_REQUEST_INTERVAL_MS = float(
+    os.getenv("WIKIMEDIA_MIN_REQUEST_INTERVAL_MS", "200")
 )
 PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES = int(
     os.getenv("PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES", "2000")
@@ -569,6 +581,10 @@ class LockedCandidate:
     source: str = "candidate_selection"
 
 
+class CandidatePortraitUnavailableError(RuntimeError):
+    pass
+
+
 @dataclass
 class FragmentNode:
     tag: str
@@ -619,6 +635,9 @@ portrait_resolution_lock = threading.Lock()
 status_resolution_cache: dict[str, str | None] = {}
 status_resolution_lock = threading.Lock()
 ip_history_lock = threading.Lock()
+candidate_bank_lock = threading.Lock()
+wikimedia_request_lock = threading.Lock()
+last_wikimedia_request_at = 0.0
 
 
 def perf_now() -> float:
@@ -994,6 +1013,163 @@ def update_ip_history(client_ip_key: str, names: list[str]) -> list[str]:
         histories[ip_key] = history
         write_ip_histories_unlocked(histories)
         return list(history)
+
+
+def candidate_bank_entry_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def prune_candidate_bank_entries(entries: list[dict]) -> list[dict]:
+    if not entries:
+        return []
+
+    cutoff_ts = time.time() - max(CANDIDATE_BANK_TTL_SECONDS, 0)
+    deduped: list[dict] = []
+    seen: set[str] = set()
+
+    for raw_entry in reversed(entries):
+        if not isinstance(raw_entry, dict):
+            continue
+        person_name = " ".join(str(raw_entry.get("person_name", "")).split())
+        if not person_name:
+            continue
+        actual_status = str(raw_entry.get("actual_status", "")).strip().lower()
+        if actual_status not in {"alive", "dead"}:
+            continue
+        normalized_key = normalize_name_key(person_name)
+        if normalized_key in seen:
+            continue
+        updated_at_raw = str(raw_entry.get("updated_at", "")).strip()
+        updated_at_dt: datetime | None = None
+        if updated_at_raw:
+            try:
+                updated_at_dt = datetime.fromisoformat(updated_at_raw.replace("Z", "+00:00"))
+            except ValueError:
+                updated_at_dt = None
+        if updated_at_dt is not None and updated_at_dt.timestamp() < cutoff_ts:
+            continue
+        seen.add(normalized_key)
+        deduped.append(
+            {
+                "person_name": person_name,
+                "actual_status": actual_status,
+                "updated_at": updated_at_dt.isoformat() if updated_at_dt else candidate_bank_entry_timestamp(),
+            }
+        )
+
+    deduped.reverse()
+    if len(deduped) > CANDIDATE_BANK_MAX_ENTRIES:
+        deduped = deduped[-CANDIDATE_BANK_MAX_ENTRIES:]
+    return deduped
+
+
+def read_candidate_bank_unlocked() -> list[dict]:
+    try:
+        if CANDIDATE_BANK_FILE.exists():
+            content = CANDIDATE_BANK_FILE.read_text(encoding="utf-8").strip()
+            if content:
+                payload = json.loads(content)
+                if isinstance(payload, list):
+                    return prune_candidate_bank_entries(payload)
+    except Exception as exc:
+        logger.error("Failed to read candidate bank: %s", exc)
+    return []
+
+
+def write_candidate_bank_unlocked(entries: list[dict]) -> None:
+    normalized_entries = prune_candidate_bank_entries(entries)
+    CANDIDATE_BANK_FILE.write_text(
+        json.dumps(normalized_entries, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+
+def select_candidates_from_bank(forbidden: list[str], limit: int) -> list[LockedCandidate]:
+    if limit <= 0:
+        return []
+    forbidden_keys = {normalize_name_key(name) for name in forbidden}
+    selected: list[LockedCandidate] = []
+    selected_keys: set[str] = set()
+    with candidate_bank_lock:
+        entries = read_candidate_bank_unlocked()
+
+    for entry in reversed(entries):
+        person_name = str(entry.get("person_name", ""))
+        actual_status = str(entry.get("actual_status", "")).strip().lower() or None
+        key = normalize_name_key(person_name)
+        if not person_name or key in forbidden_keys or key in selected_keys:
+            continue
+        selected_keys.add(key)
+        selected.append(
+            LockedCandidate(
+                person_name=person_name,
+                actual_status=actual_status,
+                source="candidate_bank",
+            )
+        )
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+
+def remember_candidates_in_bank(candidates: list[LockedCandidate]) -> None:
+    if not candidates:
+        return
+    new_entries = [
+        {
+            "person_name": " ".join(candidate.person_name.split()),
+            "actual_status": (candidate.actual_status or "").strip().lower(),
+            "updated_at": candidate_bank_entry_timestamp(),
+        }
+        for candidate in candidates
+        if candidate.person_name and (candidate.actual_status or "").strip().lower() in {"alive", "dead"}
+    ]
+    if not new_entries:
+        return
+    with candidate_bank_lock:
+        entries = read_candidate_bank_unlocked()
+        entries.extend(new_entries)
+        write_candidate_bank_unlocked(entries)
+
+
+def forget_candidate_from_bank(person_name: str) -> None:
+    person_key = normalize_name_key(person_name)
+    with candidate_bank_lock:
+        entries = read_candidate_bank_unlocked()
+        filtered = [
+            entry
+            for entry in entries
+            if normalize_name_key(str(entry.get("person_name", ""))) != person_key
+        ]
+        if len(filtered) != len(entries):
+            write_candidate_bank_unlocked(filtered)
+
+
+def url_targets_wikimedia(url: str) -> bool:
+    lowered = url.lower()
+    return (
+        "wikimedia.org" in lowered
+        or "wikipedia.org" in lowered
+        or "wikidata.org" in lowered
+    )
+
+
+def wait_for_wikimedia_request_slot(url: str) -> None:
+    if not url_targets_wikimedia(url):
+        return
+
+    global last_wikimedia_request_at
+    min_interval_seconds = max(WIKIMEDIA_MIN_REQUEST_INTERVAL_MS, 0.0) / 1000.0
+    if min_interval_seconds <= 0:
+        return
+
+    with wikimedia_request_lock:
+        elapsed = time.monotonic() - last_wikimedia_request_at
+        remaining = min_interval_seconds - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        last_wikimedia_request_at = time.monotonic()
 
 
 def collect_ip_reserved_names(client_ip_key: str, exclude_session_id: str | None = None) -> list[str]:
@@ -1526,6 +1702,7 @@ def fetch_json_url(url: str, timeout_seconds: float, user_agent: str) -> dict:
         method="GET",
     )
     try:
+        wait_for_wikimedia_request_slot(url)
         with urlopen(request, timeout=timeout_seconds) as response:
             status = getattr(response, "status", None) or response.getcode()
             if status and status >= 400:
@@ -1568,6 +1745,7 @@ def validate_image_url_reachable(image_source: str, person_name: str, label: str
             method=method,
         )
         try:
+            wait_for_wikimedia_request_slot(image_source)
             with urlopen(request, timeout=IMAGE_URL_VALIDATION_TIMEOUT_SECONDS) as response:
                 status = getattr(response, "status", None) or response.getcode()
                 content_type = str(response.headers.get_content_type()).lower()
@@ -2663,8 +2841,23 @@ def negotiate_round_candidates_sync(
     working_forbidden = list(dict.fromkeys(forbidden))
     retry_notes: list[str] = []
     errors: list[str] = []
-    approved: list[LockedCandidate] = []
+    approved: list[LockedCandidate] = select_candidates_from_bank(working_forbidden, pool_size)
     last_successful_model: str | None = None
+
+    if approved:
+        working_forbidden = merge_names_recency_preserving(
+            working_forbidden,
+            [candidate.person_name for candidate in approved],
+        )
+        append_gemini_audit_log(
+            "candidate_bank.reuse",
+            status="accepted",
+            accepted_count=len(approved),
+            person_names=[candidate.person_name for candidate in approved],
+            **audit_meta,
+        )
+        if len(approved) >= pool_size:
+            return "candidate_bank", approved
 
     for attempt in range(SESSION_NEGOTIATION_ATTEMPTS):
         if len(approved) >= pool_size:
@@ -2715,6 +2908,7 @@ def negotiate_round_candidates_sync(
                 )
                 accepted_this_attempt += len(candidates)
                 last_successful_model = model_name
+                remember_candidates_in_bank(candidates)
                 append_gemini_audit_log(
                     "gemini.candidate_selection_result",
                     model=model_name,
@@ -2838,6 +3032,8 @@ def generate_single_round_sync(
                     try:
                         return future.result()
                     except Exception as exc:
+                        if should_skip_candidate_on_portrait_failure(str(exc)):
+                            raise CandidatePortraitUnavailableError(str(exc)) from exc
                         logger.warning(
                             "Generation failed for %s on attempt %s: %s",
                             model_name,
@@ -2865,6 +3061,8 @@ def generate_single_round_sync(
                     locked_candidate.actual_status,
                 )
             except Exception as exc:
+                if should_skip_candidate_on_portrait_failure(str(exc)):
+                    raise CandidatePortraitUnavailableError(str(exc)) from exc
                 logger.warning(
                     "Generation failed for %s on attempt %s: %s",
                     model_name,
@@ -2940,11 +3138,11 @@ def build_portrait_fallback_svg(person_name: str) -> str:
     </filter>
   </defs>
   <g filter="url(#glow)">
-    <circle cx="300" cy="300" r="230" fill="url(#avatar)" />
-    <circle cx="300" cy="300" r="230" fill="none" stroke="url(#ring)" stroke-width="14" />
-    <circle cx="300" cy="300" r="144" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
+    <circle cx="300" cy="300" r="212" fill="url(#avatar)" />
+    <circle cx="300" cy="300" r="212" fill="none" stroke="url(#ring)" stroke-width="12" />
+    <circle cx="300" cy="300" r="126" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
   </g>
-  <text x="300" y="336" text-anchor="middle" fill="#f8fafc" font-size="132" font-family="Arial, Helvetica, sans-serif" font-weight="700">{escaped_initials}</text>
+  <text x="300" y="332" text-anchor="middle" fill="#f8fafc" font-size="128" font-family="Arial, Helvetica, sans-serif" font-weight="700">{escaped_initials}</text>
 </svg>"""
 
 
@@ -2952,6 +3150,7 @@ def collect_session_reserved_names(session: dict) -> list[str]:
     reserved_names: list[str] = []
     reserved_names.extend(session.get("reserved_names", []))
     reserved_names.extend(session.get("used_names", []))
+    reserved_names.extend(session.get("excluded_candidates", []))
     active_round = session.get("active_round") or {}
     if active_round.get("person_name"):
         reserved_names.append(str(active_round["person_name"]))
@@ -3022,66 +3221,147 @@ def build_candidate_negotiation_forbidden(session: dict) -> list[str]:
     return merge_names_recency_preserving([], forbidden)
 
 
+def should_skip_candidate_on_portrait_failure(error_message: str) -> bool:
+    lowered = error_message.lower()
+    return (
+        "no valid wikimedia portrait found" in lowered
+        or "portrait_search_query resolution failed" in lowered
+    )
+
+
+def exclude_round_candidate(
+    session: dict,
+    target_round_number: int,
+    locked_candidate: LockedCandidate,
+    reason: str,
+) -> None:
+    candidate_index = target_round_number - 1
+    round_candidates = session.get("round_candidates", [])
+    if 0 <= candidate_index < len(round_candidates):
+        round_candidates.pop(candidate_index)
+
+    session["reserved_names"] = [
+        name
+        for name in session.get("reserved_names", [])
+        if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
+    ]
+    session["excluded_candidates"] = merge_names_recency_preserving(
+        session.get("excluded_candidates", []),
+        [locked_candidate.person_name],
+    )
+    forget_candidate_from_bank(locked_candidate.person_name)
+    append_gemini_audit_log(
+        "round.candidate_excluded",
+        status="excluded",
+        person_name=locked_candidate.person_name,
+        reason=reason,
+        session_id=session.get("session_id"),
+        target_round_number=target_round_number,
+    )
+
+
 async def generate_round_payload(
     session: dict,
     target_round_number: int,
     model_candidates: list[str],
     race_models: bool = False,
 ) -> tuple[str, dict]:
-    locked_candidate = get_session_round_candidate(session, target_round_number)
-    if STATUS_VALIDATION_ENABLED:
-        append_gemini_audit_log(
-            "round.status_validation",
-            status="enabled",
-            person_name=locked_candidate.person_name,
-            proposed_status=locked_candidate.actual_status,
-            target_round_number=target_round_number,
-            session_id=session.get("session_id"),
-        )
-        verified_candidate = await asyncio.to_thread(
-            verify_locked_candidate_status,
-            locked_candidate,
-        )
-        if verified_candidate != locked_candidate:
-            session["round_candidates"][target_round_number - 1]["actual_status"] = (
-                verified_candidate.actual_status
+    portrait_skip_count = 0
+
+    while True:
+        if len(session.get("round_candidates", [])) < target_round_number:
+            await top_up_session_candidates(session.get("session_id"))
+        if len(session.get("round_candidates", [])) < target_round_number:
+            raise RuntimeError(
+                f"No negotiated candidate available for round {target_round_number}"
             )
-            session["round_candidates"][target_round_number - 1]["source"] = (
-                verified_candidate.source
-            )
-            locked_candidate = verified_candidate
-    else:
-        append_gemini_audit_log(
-            "round.status_validation",
-            status="disabled",
-            person_name=locked_candidate.person_name,
-            proposed_status=locked_candidate.actual_status,
-            target_round_number=target_round_number,
-            session_id=session.get("session_id"),
-        )
-        if locked_candidate.actual_status is not None:
-            locked_candidate = LockedCandidate(
+
+        locked_candidate = get_session_round_candidate(session, target_round_number)
+        if STATUS_VALIDATION_ENABLED:
+            append_gemini_audit_log(
+                "round.status_validation",
+                status="enabled",
                 person_name=locked_candidate.person_name,
-                actual_status=None,
-                source=f"{locked_candidate.source}_status_unlocked",
+                proposed_status=locked_candidate.actual_status,
+                target_round_number=target_round_number,
+                session_id=session.get("session_id"),
             )
-    forbidden = build_round_generation_forbidden(session, locked_candidate)
-    model_name, round_data = await asyncio.to_thread(
-        generate_single_round_sync,
-        forbidden,
-        locked_candidate,
-        model_candidates,
-        race_models,
-    )
-    session["used_names"] = merge_names_recency_preserving(
-        session.get("used_names", []),
-        [round_data["person_name"]],
-    )
-    session["round_candidates"][target_round_number - 1]["actual_status"] = round_data["actual_status"]
-    runtime_state["last_model"] = model_name
-    runtime_state["last_error"] = None
-    logger.info("Generated round %s using %s", target_round_number, model_name)
-    return model_name, round_data
+            verified_candidate = await asyncio.to_thread(
+                verify_locked_candidate_status,
+                locked_candidate,
+            )
+            if verified_candidate != locked_candidate:
+                session["round_candidates"][target_round_number - 1]["actual_status"] = (
+                    verified_candidate.actual_status
+                )
+                session["round_candidates"][target_round_number - 1]["source"] = (
+                    verified_candidate.source
+                )
+                locked_candidate = verified_candidate
+        else:
+            append_gemini_audit_log(
+                "round.status_validation",
+                status="disabled",
+                person_name=locked_candidate.person_name,
+                proposed_status=locked_candidate.actual_status,
+                target_round_number=target_round_number,
+                session_id=session.get("session_id"),
+            )
+            if locked_candidate.actual_status is not None:
+                locked_candidate = LockedCandidate(
+                    person_name=locked_candidate.person_name,
+                    actual_status=None,
+                    source=f"{locked_candidate.source}_status_unlocked",
+                )
+
+        forbidden = build_round_generation_forbidden(session, locked_candidate)
+        try:
+            model_name, round_data = await asyncio.to_thread(
+                generate_single_round_sync,
+                forbidden,
+                locked_candidate,
+                model_candidates,
+                race_models,
+            )
+        except CandidatePortraitUnavailableError as exc:
+            portrait_skip_count += 1
+            exclude_round_candidate(
+                session,
+                target_round_number,
+                locked_candidate,
+                str(exc),
+            )
+            logger.warning(
+                "Skipping %s for round %s after portrait failure: %s",
+                locked_candidate.person_name,
+                target_round_number,
+                exc,
+            )
+            schedule_candidate_topup(session.get("session_id"))
+            if portrait_skip_count >= max(SESSION_CANDIDATE_TARGET_COUNT, 10):
+                raise RuntimeError(
+                    f"Unable to find a portraitable candidate for round {target_round_number}"
+                ) from exc
+            continue
+
+        session["used_names"] = merge_names_recency_preserving(
+            session.get("used_names", []),
+            [round_data["person_name"]],
+        )
+        remember_candidates_in_bank(
+            [
+                LockedCandidate(
+                    person_name=round_data["person_name"],
+                    actual_status=round_data["actual_status"],
+                    source="round_generation",
+                )
+            ]
+        )
+        session["round_candidates"][target_round_number - 1]["actual_status"] = round_data["actual_status"]
+        runtime_state["last_model"] = model_name
+        runtime_state["last_error"] = None
+        logger.info("Generated round %s using %s", target_round_number, model_name)
+        return model_name, round_data
 
 
 async def generate_round_for_session(
@@ -3190,7 +3470,6 @@ async def top_up_session_candidates(session_id: str) -> None:
                 }
                 for candidate in new_candidates
             )
-            update_ip_history(client_ip_key, new_names)
             current_session["candidate_topup_error"] = None
             logger.info(
                 "Background candidate top-up added %s celebrities for session %s (%s total reserved)",
@@ -3489,6 +3768,10 @@ async def status():
         "ip_history_max_names": IP_HISTORY_MAX_NAMES,
         "session_candidate_count": SESSION_APPROVED_POOL_SIZE,
         "session_candidate_target_count": SESSION_CANDIDATE_TARGET_COUNT,
+        "candidate_bank_file": str(CANDIDATE_BANK_FILE),
+        "candidate_bank_max_entries": CANDIDATE_BANK_MAX_ENTRIES,
+        "candidate_bank_ttl_seconds": CANDIDATE_BANK_TTL_SECONDS,
+        "wikimedia_min_request_interval_ms": WIKIMEDIA_MIN_REQUEST_INTERVAL_MS,
         "image_contract": "backend_wikimedia_query_resolution",
     }
 
@@ -3524,7 +3807,6 @@ async def start_session(request: FastAPIRequest):
             },
         )
         reserved_names = [candidate.person_name for candidate in round_candidates]
-        update_ip_history(client_ip_key, reserved_names)
         session = {
             "session_id": session_id,
             "client_ip_key": client_ip_key,
@@ -3533,6 +3815,7 @@ async def start_session(request: FastAPIRequest):
             "history": [],
             "used_names": [],
             "reserved_names": reserved_names,
+            "excluded_candidates": [],
             "round_candidates": [
                 {
                     "person_name": candidate.person_name,
@@ -3561,6 +3844,7 @@ async def start_session(request: FastAPIRequest):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     session["round_number"] = 1
+    update_ip_history(client_ip_key, [round_data["person_name"]])
     schedule_prefetch(session_id)
     schedule_candidate_topup(session_id)
     return {
@@ -3586,6 +3870,7 @@ async def next_round(session_id: str):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     session["round_number"] += 1
+    update_ip_history(session.get("client_ip_key", "unknown"), [round_data["person_name"]])
     schedule_prefetch(session_id)
     schedule_candidate_topup(session_id)
     return {"status": "playing", "guessing_ui_html": round_data["guessing_ui_html"]}
