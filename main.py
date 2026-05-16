@@ -82,6 +82,9 @@ CANDIDATE_SELECTION_MIN_COUNT = int(os.getenv("CANDIDATE_SELECTION_MIN_COUNT", "
 SESSION_APPROVED_POOL_SIZE = int(
     os.getenv("SESSION_APPROVED_POOL_SIZE", str(ROUNDS_PER_GAME))
 )
+SESSION_CANDIDATE_TARGET_COUNT = int(
+    os.getenv("SESSION_CANDIDATE_TARGET_COUNT", "30")
+)
 IP_HISTORY_MAX_NAMES = int(os.getenv("IP_HISTORY_MAX_NAMES", "1000"))
 SESSION_NEGOTIATION_ATTEMPTS = int(os.getenv("SESSION_NEGOTIATION_ATTEMPTS", "3"))
 ROUND_UI_TEMPERATURE = float(os.getenv("ROUND_UI_TEMPERATURE", "0.65"))
@@ -116,13 +119,17 @@ WIKIMEDIA_SEARCH_TIMEOUT_SECONDS = float(
     os.getenv("WIKIMEDIA_SEARCH_TIMEOUT_SECONDS", "3.0")
 )
 WIKIMEDIA_SEARCH_LIMIT = int(os.getenv("WIKIMEDIA_SEARCH_LIMIT", "8"))
+APP_CONTACT_URL = os.getenv(
+    "APP_CONTACT_URL",
+    "https://www.maliaplace.com/alive-or-dead",
+)
 IMAGE_FETCH_USER_AGENT = os.getenv(
     "IMAGE_FETCH_USER_AGENT",
-    f"AliveOrDeadPOC/{APP_VERSION} (image validation)",
+    f"AliveOrDeadPOC/{APP_VERSION} ({APP_CONTACT_URL}; image validation)",
 )
 WIKIMEDIA_API_USER_AGENT = os.getenv(
     "WIKIMEDIA_API_USER_AGENT",
-    f"AliveOrDeadPOC/{APP_VERSION} (wikimedia search)",
+    f"AliveOrDeadPOC/{APP_VERSION} ({APP_CONTACT_URL}; wikimedia search)",
 )
 FAST_MODEL_CANDIDATES = [
     item.strip()
@@ -2916,28 +2923,28 @@ def build_portrait_fallback_svg(person_name: str) -> str:
     display_name = " ".join(person_name.split())[:60] or "Unknown"
     name_tokens = [token for token in display_name.split() if token]
     initials = "".join(token[0].upper() for token in name_tokens[:2]) or "?"
-    escaped_name = html.escape(display_name)
     escaped_initials = html.escape(initials)
+    escaped_name = html.escape(display_name)
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600" role="img" aria-label="{escaped_name}">
   <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1e1b4b" />
-      <stop offset="100%" stop-color="#5b21b6" />
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa" />
+      <stop offset="100%" stop-color="#c084fc" />
     </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#09090b" flood-opacity="0.28" />
+    <radialGradient id="avatar" cx="35%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#4338ca" />
+      <stop offset="100%" stop-color="#312e81" />
+    </radialGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="26" flood-color="#0f172a" flood-opacity="0.28" />
     </filter>
   </defs>
-  <rect width="600" height="600" rx="56" fill="url(#bg)" />
-  <rect x="26" y="26" width="548" height="548" rx="44" fill="none" stroke="rgba(250,204,21,0.9)" stroke-width="8" />
-  <circle cx="300" cy="248" r="112" fill="rgba(255,255,255,0.08)" />
-  <circle cx="300" cy="248" r="112" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2" />
-  <text x="300" y="286" text-anchor="middle" fill="#f8fafc" font-size="108" font-family="Arial, Helvetica, sans-serif" font-weight="700">{escaped_initials}</text>
-  <g filter="url(#shadow)">
-    <rect x="144" y="404" width="312" height="74" rx="37" fill="rgba(9,9,11,0.2)" />
+  <g filter="url(#glow)">
+    <circle cx="300" cy="300" r="230" fill="url(#avatar)" />
+    <circle cx="300" cy="300" r="230" fill="none" stroke="url(#ring)" stroke-width="14" />
+    <circle cx="300" cy="300" r="144" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
   </g>
-  <text x="300" y="448" text-anchor="middle" fill="#f8fafc" font-size="52" font-family="Arial, Helvetica, sans-serif" font-weight="700">{escaped_name}</text>
-  <text x="300" y="514" text-anchor="middle" fill="rgba(248,250,252,0.8)" font-size="24" font-family="Arial, Helvetica, sans-serif" letter-spacing="1.5">Avatar fallback</text>
+  <text x="300" y="336" text-anchor="middle" fill="#f8fafc" font-size="132" font-family="Arial, Helvetica, sans-serif" font-weight="700">{escaped_initials}</text>
 </svg>"""
 
 
@@ -3004,6 +3011,15 @@ def build_round_generation_forbidden(
         for name in forbidden
         if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
     ]
+
+
+def build_candidate_negotiation_forbidden(session: dict) -> list[str]:
+    client_ip_key = session.get("client_ip_key", "unknown")
+    forbidden: list[str] = []
+    forbidden.extend(get_ip_history(client_ip_key))
+    forbidden.extend(collect_ip_reserved_names(client_ip_key))
+    forbidden.extend(collect_session_reserved_names(session))
+    return merge_names_recency_preserving([], forbidden)
 
 
 async def generate_round_payload(
@@ -3124,6 +3140,75 @@ async def prefetch_next_rounds(session_id: str) -> None:
             current_session["prefetch_task"] = None
 
 
+async def top_up_session_candidates(session_id: str) -> None:
+    session = sessions.get(session_id)
+    if not session:
+        return
+
+    client_ip_key = session.get("client_ip_key", "unknown")
+    try:
+        while True:
+            current_session = sessions.get(session_id)
+            if current_session is None:
+                return
+
+            needed = SESSION_CANDIDATE_TARGET_COUNT - len(current_session.get("round_candidates", []))
+            if needed <= 0:
+                return
+
+            forbidden = build_candidate_negotiation_forbidden(current_session)
+            ip_history = get_ip_history(client_ip_key)
+            _, new_candidates = await asyncio.to_thread(
+                negotiate_round_candidates_sync,
+                forbidden,
+                ip_history,
+                BACKGROUND_MODEL_CANDIDATES,
+                needed,
+                {
+                    "session_id": session_id,
+                    "client_ip_key": client_ip_key,
+                    "background_topup": True,
+                },
+            )
+
+            current_session = sessions.get(session_id)
+            if current_session is None:
+                return
+            if not new_candidates:
+                return
+
+            new_names = [candidate.person_name for candidate in new_candidates]
+            current_session["reserved_names"] = merge_names_recency_preserving(
+                current_session.get("reserved_names", []),
+                new_names,
+            )
+            current_session["round_candidates"].extend(
+                {
+                    "person_name": candidate.person_name,
+                    "actual_status": candidate.actual_status,
+                    "source": candidate.source,
+                }
+                for candidate in new_candidates
+            )
+            update_ip_history(client_ip_key, new_names)
+            current_session["candidate_topup_error"] = None
+            logger.info(
+                "Background candidate top-up added %s celebrities for session %s (%s total reserved)",
+                len(new_candidates),
+                session_id,
+                len(current_session["round_candidates"]),
+            )
+    except Exception as exc:
+        current_session = sessions.get(session_id)
+        if current_session is not None:
+            current_session["candidate_topup_error"] = str(exc)
+        logger.warning("Candidate top-up failed for session %s: %s", session_id, exc)
+    finally:
+        current_session = sessions.get(session_id)
+        if current_session is not None:
+            current_session["candidate_topup_task"] = None
+
+
 def schedule_prefetch(session_id: str) -> None:
     session = sessions.get(session_id)
     if not session:
@@ -3138,6 +3223,20 @@ def schedule_prefetch(session_id: str) -> None:
         return
 
     session["prefetch_task"] = asyncio.create_task(prefetch_next_rounds(session_id))
+
+
+def schedule_candidate_topup(session_id: str) -> None:
+    session = sessions.get(session_id)
+    if not session:
+        return
+    if len(session.get("round_candidates", [])) >= SESSION_CANDIDATE_TARGET_COUNT:
+        return
+
+    existing_task = session.get("candidate_topup_task")
+    if existing_task is not None and not existing_task.done():
+        return
+
+    session["candidate_topup_task"] = asyncio.create_task(top_up_session_candidates(session_id))
 
 
 async def get_next_round_for_session(session_id: str, session: dict) -> dict:
@@ -3389,6 +3488,7 @@ async def status():
         "repeat_history_scope": "per_ip_fifo",
         "ip_history_max_names": IP_HISTORY_MAX_NAMES,
         "session_candidate_count": SESSION_APPROVED_POOL_SIZE,
+        "session_candidate_target_count": SESSION_CANDIDATE_TARGET_COUNT,
         "image_contract": "backend_wikimedia_query_resolution",
     }
 
@@ -3445,6 +3545,8 @@ async def start_session(request: FastAPIRequest):
             "queued_rounds": [],
             "prefetch_task": None,
             "prefetch_error": None,
+            "candidate_topup_task": None,
+            "candidate_topup_error": None,
         }
         sessions[session_id] = session
         round_data = await generate_round_for_session(
@@ -3460,6 +3562,7 @@ async def start_session(request: FastAPIRequest):
 
     session["round_number"] = 1
     schedule_prefetch(session_id)
+    schedule_candidate_topup(session_id)
     return {
         "session_id": session_id,
         "status": "ready",
@@ -3484,6 +3587,7 @@ async def next_round(session_id: str):
 
     session["round_number"] += 1
     schedule_prefetch(session_id)
+    schedule_candidate_topup(session_id)
     return {"status": "playing", "guessing_ui_html": round_data["guessing_ui_html"]}
 
 
