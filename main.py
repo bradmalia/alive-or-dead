@@ -47,7 +47,7 @@ if legacy_genai and api_key:
     legacy_genai.configure(api_key=api_key)
 
 BASE_DIR = Path(__file__).resolve().parent
-GLOBAL_HISTORY_FILE = BASE_DIR / "global_history.json"
+IP_HISTORY_FILE = BASE_DIR / "ip_history.json"
 
 
 def normalize_app_base_path(raw_value: str | None) -> str:
@@ -63,18 +63,29 @@ def app_path(path: str) -> str:
     normalized_path = path if path.startswith("/") else f"/{path}"
     return f"{APP_BASE_PATH}{normalized_path}" if APP_BASE_PATH else normalized_path
 
-APP_VERSION = "3.5.1"
+APP_VERSION = "3.6.1"
 APP_BASE_PATH = normalize_app_base_path(os.getenv("APP_BASE_PATH", ""))
 ROUNDS_PER_GAME = 10
-GLOBAL_HISTORY_PROMPT_LIMIT = int(os.getenv("GLOBAL_HISTORY_PROMPT_LIMIT", "500"))
 ROUND_GENERATION_ATTEMPTS = int(os.getenv("ROUND_GENERATION_ATTEMPTS", "3"))
 PREFETCH_ROUND_BUFFER = int(os.getenv("PREFETCH_ROUND_BUFFER", "2"))
-CANDIDATE_SELECTION_COUNT = int(os.getenv("CANDIDATE_SELECTION_COUNT", "20"))
-GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.35"))
-GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.8"))
-GENERATION_MAX_OUTPUT_TOKENS = int(os.getenv("GENERATION_MAX_OUTPUT_TOKENS", "2400"))
+CANDIDATE_SELECTION_COUNT = int(os.getenv("CANDIDATE_SELECTION_COUNT", "60"))
+CANDIDATE_SELECTION_MIN_COUNT = int(os.getenv("CANDIDATE_SELECTION_MIN_COUNT", "24"))
+SESSION_APPROVED_POOL_SIZE = int(
+    os.getenv("SESSION_APPROVED_POOL_SIZE", str(ROUNDS_PER_GAME))
+)
+IP_HISTORY_MAX_NAMES = int(os.getenv("IP_HISTORY_MAX_NAMES", "1000"))
+SESSION_NEGOTIATION_ATTEMPTS = int(os.getenv("SESSION_NEGOTIATION_ATTEMPTS", "3"))
+ROUND_UI_TEMPERATURE = float(os.getenv("ROUND_UI_TEMPERATURE", "0.65"))
+ROUND_UI_TOP_P = float(os.getenv("ROUND_UI_TOP_P", "0.95"))
+ROUND_UI_MAX_OUTPUT_TOKENS = int(os.getenv("ROUND_UI_MAX_OUTPUT_TOKENS", "3200"))
+CANDIDATE_SELECTION_TEMPERATURE = float(
+    os.getenv("CANDIDATE_SELECTION_TEMPERATURE", "0.35")
+)
+CANDIDATE_SELECTION_TOP_P = float(
+    os.getenv("CANDIDATE_SELECTION_TOP_P", "0.8")
+)
 CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS = int(
-    os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "1600")
+    os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "4500")
 )
 RACE_FAST_MODELS = os.getenv("RACE_FAST_MODELS", "true").lower() == "true"
 PERF_LOG_ENABLED = os.getenv("PERF_LOG_ENABLED", "true").lower() == "true"
@@ -123,6 +134,11 @@ NEXT_ROUND_RE = re.compile(r"loadNextRound\(\)")
 IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*(['\"])(.*?)\1", re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
+TAILWIND_OPACITY_RE = re.compile(r"opacity-(\d{1,3})$")
+TAILWIND_SCALE_RE = re.compile(r"scale-(\d{2,3})$")
+INLINE_OPACITY_RE = re.compile(r"opacity\s*:\s*(0(?:\.\d+)?|1(?:\.0+)?)", re.IGNORECASE)
+INLINE_BLUR_RE = re.compile(r"blur\s*\(", re.IGNORECASE)
+INLINE_SCALE_RE = re.compile(r"scale\s*\(\s*([0-9.]+)", re.IGNORECASE)
 QUOTED_TEXT_RE = re.compile(r'"[^"]{1,160}"|\'[^\']{1,160}\'|“[^”]{1,160}”|‘[^’]{1,160}’')
 REMOTE_IMAGE_PREFIXES = ("http://", "https://", "//")
 WIKIMEDIA_DOMAIN_MARKERS = ("wikimedia.org", "wikipedia.org")
@@ -150,6 +166,127 @@ VALID_WIKIMEDIA_THUMB_WIDTHS = {
 }
 SUPPORTED_RASTER_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 COMMONS_QUERY_NOISE_RE = re.compile(r"\b(?:wikimedia|wikipedia|commons)\b", re.IGNORECASE)
+GENERIC_PORTRAIT_QUERY_TOKENS = {
+    "portrait",
+    "headshot",
+    "publicity",
+    "press",
+    "photo",
+    "photos",
+    "publicityphoto",
+}
+CONTEXT_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "their",
+    "they",
+    "them",
+    "his",
+    "her",
+    "its",
+    "into",
+    "across",
+    "known",
+    "most",
+    "famous",
+    "fact",
+    "once",
+    "like",
+    "both",
+    "beloved",
+    "iconic",
+    "legendary",
+    "career",
+    "continues",
+    "continued",
+}
+CONTEXT_FAMILY_KEYWORDS = {
+    "acting": {
+        "actor",
+        "actress",
+        "film",
+        "films",
+        "movie",
+        "movies",
+        "screen",
+        "television",
+        "tv",
+        "sitcom",
+        "series",
+        "comedy",
+        "comedian",
+        "role",
+        "roles",
+        "blockbuster",
+        "heroic",
+        "hero",
+        "star",
+    },
+    "music": {
+        "singer",
+        "song",
+        "songs",
+        "album",
+        "albums",
+        "music",
+        "musician",
+        "band",
+        "guitar",
+        "guitarist",
+        "rapper",
+        "composer",
+        "performer",
+    },
+    "sports": {
+        "athlete",
+        "sports",
+        "player",
+        "football",
+        "baseball",
+        "basketball",
+        "tennis",
+        "boxing",
+        "boxer",
+        "olympic",
+        "golfer",
+        "racer",
+    },
+    "politics": {
+        "president",
+        "politician",
+        "senator",
+        "governor",
+        "campaign",
+        "white",
+        "house",
+        "statesman",
+        "minister",
+        "prime",
+    },
+    "science": {
+        "scientist",
+        "physicist",
+        "astronaut",
+        "inventor",
+        "mathematician",
+        "researcher",
+        "professor",
+    },
+}
+PAGE_ROLE_MISMATCH_KEYWORDS = {
+    "acting": {"presenter", "broadcaster", "radio", "host", "dj"},
+}
+GUESSING_PORTRAIT_MIN_OPACITY = float(
+    os.getenv("GUESSING_PORTRAIT_MIN_OPACITY", "0.75")
+)
+GUESSING_PORTRAIT_MAX_SCALE = float(
+    os.getenv("GUESSING_PORTRAIT_MAX_SCALE", "1.1")
+)
 COMMONS_CANDIDATE_BONUSES = (
     ("portrait", 6),
     ("headshot", 5),
@@ -343,7 +480,7 @@ class CandidatePerson(BaseModel):
 
 
 class CandidateSelection(BaseModel):
-    candidates: list[CandidatePerson] = Field(min_length=1, max_length=20)
+    candidates: list[CandidatePerson] = Field(min_length=1, max_length=200)
 
 
 @dataclass(frozen=True)
@@ -400,6 +537,7 @@ image_url_validation_cache: dict[str, tuple[bool, str]] = {}
 image_url_validation_lock = threading.Lock()
 portrait_resolution_cache: dict[tuple[str, str], tuple[bool, str]] = {}
 portrait_resolution_lock = threading.Lock()
+ip_history_lock = threading.Lock()
 
 
 def perf_now() -> float:
@@ -458,7 +596,10 @@ Critical forbidden-list compliance:
 Round requirements:
 - Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable.
 - Never pick anyone from the forbidden list in the user prompt.
-- Theme the UI around what the person is most famous for. Example: Ozzy Osbourne can imply stage lighting, guitar shapes, tour-poster energy.
+- Theme the UI around what the person is most famous for, but do not default to the same composition or design language every time.
+- Make each round feel visually distinct. Vary composition, information density, panel structure, accents, pacing, and typography treatment from round to round.
+- Choose the layout that best fits the person. It can be poster-like, editorial, tabloid, scoreboard-like, magazine-like, dossier-like, ticket-like, stage-like, or another strong visual direction.
+- Push the creative treatment further than a normal app card. Be bold, thematic, and visually specific.
 - The guessing page must include:
   - the person's name as the biggest text
   - one short status-neutral description of what they are most famous for
@@ -479,6 +620,15 @@ Output rules:
 - The guessing page must contain exactly one `<img>` whose `src` is the exact literal `__PORTRAIT_IMAGE_URL__`.
 - The reveal page may omit the portrait, but if it includes one, it must reuse the exact same `__PORTRAIT_IMAGE_URL__` placeholder.
 - Do not place `__PORTRAIT_IMAGE_URL__` anywhere except an `<img src>` attribute.
+- The single portrait image may be used boldly, but on the guessing page it must still read as a clear, recognizable portrait rather than an abstract texture.
+- If you want the portrait to feel atmospheric, keep it sharp enough to recognize the person. Do not blur the only portrait image, do not fade it into near-transparency, and do not zoom so aggressively that the head is heavily truncated.
+- Avoid using the only guessing-page portrait as a pure background wash. It should remain a readable photo element, even in a dramatic composition.
+- Never repeat `__PORTRAIT_IMAGE_URL__` in CSS `url(...)`, inline styles, text, data attributes, masks, pseudo-background tricks, or additional `<img>` tags.
+- Treat the portrait as one physical photo element. Build frames, glows, overlays, shadows, spotlights, and scenery around it with normal `<div>` layers, not by duplicating the portrait placeholder.
+- Preserve the subject's face as a focal point. Keep the eyes and upper face clearly visible and readable in the final composition.
+- Do not place large opaque text panels, badges, white fades, or heavy overlays across the eyes, forehead, or central face area.
+- If text overlaps the portrait at all, place it in lower-third or side negative-space zones and keep the face unobstructed.
+- Avoid crops or overlay treatments that make the portrait feel cut off at the eyes or washed out through the middle of the face.
 - Put the `submitGuess('alive')` and `submitGuess('dead')` buttons in a dedicated controls block outside the portrait area.
 - The guess buttons must never overlap the portrait, float over the portrait, or appear inside the portrait panel.
 - Do not use absolute or fixed positioning, inset utilities, negative margins, or translate utilities to place the guess buttons over the image.
@@ -486,10 +636,19 @@ Output rules:
 - If you need a square or shaped portrait area, use core Tailwind utilities like `aspect-square`, explicit `h-*`, `w-*`, `min-h-*`, and normal layout sizing instead.
 - Do not use any remote URL or CSS `url(...)` inside backgrounds, overlays, masks, or decorative styles.
 - Do not include extra `<img>` tags for logos, title cards, decorative textures, or background art.
-- If you want atmosphere, use gradients, borders, overlays, badges, shapes, labels, and typography.
-- Keep each HTML fragment concise. Target under 1400 characters.
-- Prefer a bold split layout or layered poster layout, not a generic centered card.
+- Be creatively ambitious within the HTML/Tailwind-only constraint. Use hierarchy, asymmetry, sections, badges, dividers, callouts, kicker labels, stat blocks, atmospheric color, and other layout devices when they fit.
+- Built-in Tailwind animation and transition classes are allowed. Use a few purposeful motions like pulse, bounce, spin, shimmer-like movement, drifting lights, or reveal energy when they fit the theme.
+- You may build thematic scenery and props from plain HTML/CSS structure alone: for example a TV frame for a TV star, stage lights or curtains for a performer, guitar-like silhouettes for a musician, marquees, tickets, tabloid bursts, scoreboards, dossiers, or dramatic spotlights.
+- You may use absolute-positioned decorative layers, borders, glows, gradients, blur, rotations, and atmospheric shapes for non-button elements.
+- Avoid repeating the same safe layout shell. Do not default to a generic centered card or the same two-column composition every round unless it is clearly the strongest fit for that person.
+- Avoid repeating the same typography formula, same badge placement, same image treatment, or same information order every round.
+- The reveal page should feel like a deliberate continuation or escalation of the guessing page concept, not just the same shell with new text.
+- Keep each HTML fragment concise, but you may use richer structure and more layered presentation. Target under 3000 characters.
 - Keep button text high contrast.
+- Do not include literal backslash escape sequences like `\\n`, `\\r`, or `\\t` in the final HTML fragments.
+- Design for a single-screen experience. The full guessing page and reveal page should fit comfortably in a normal desktop browser viewport without requiring vertical scrolling.
+- Prefer compact spacing, restrained portrait sizing, and tighter composition when needed so the entire round is visible at once.
+- Do not build tall poster layouts that push the buttons or key copy below the fold.
 
 Spoiler rules for the guessing page:
 - Never mention death, assassination, murder, funeral, memorial, burial, "late", "still alive", or any status-revealing phrasing.
@@ -501,13 +660,14 @@ Spoiler rules for the guessing page:
 
 
 CANDIDATE_SELECTION_PROMPT = """
-Generate candidate people for one round of an "Alive or Dead" guessing game.
+Generate candidate people for one session of an "Alive or Dead" guessing game.
 
 Return only raw JSON with:
 - `candidates`
 
 Candidate rules:
 - Return exactly [CANDIDATE_COUNT] candidates.
+- The backend will choose a 10-person round plan from your larger candidate list, so give a deep, varied bench instead of a short list of obvious staples.
 - Each candidate must include:
   - `person_name`
   - `actual_status`
@@ -516,7 +676,9 @@ Candidate rules:
 - Use canonical common public names only.
 - Do not include duplicate people, aliases of the same person, or close variants of the same name.
 - Prefer a diverse set of candidates instead of repeating the same obvious names.
-- If many obvious celebrity staples are already forbidden, go deeper and return less overused but still guessable famous people.
+- Do not default to the same obituary-canon or trivia-canon staples over and over.
+- If many obvious celebrity staples are already forbidden, pivot hard into less overused but still broadly recognizable famous people.
+- Spread the list across different eras and domains such as film, television, music, sports, public life, and culture rather than clustering around the same few classic dead celebrities.
 
 Critical forbidden-list compliance:
 - The forbidden list is authoritative and overrides every other instruction.
@@ -568,17 +730,6 @@ def extract_json(text: str) -> dict | list | None:
     return None
 
 
-def get_global_history() -> list[str]:
-    try:
-        if GLOBAL_HISTORY_FILE.exists():
-            content = GLOBAL_HISTORY_FILE.read_text(encoding="utf-8").strip()
-            if content:
-                return json.loads(content)
-    except Exception as exc:
-        logger.error("Failed to read global history: %s", exc)
-    return []
-
-
 def merge_names_recency_preserving(existing_names: list[str], incoming_names: list[str]) -> list[str]:
     merged = list(existing_names)
     for raw_name in incoming_names:
@@ -591,13 +742,93 @@ def merge_names_recency_preserving(existing_names: list[str], incoming_names: li
     return merged
 
 
-def update_global_history(names: list[str]) -> None:
+def trim_fifo_names(names: list[str], max_names: int) -> list[str]:
+    if max_names <= 0:
+        return []
+    return list(names[-max_names:])
+
+
+def normalize_client_ip(raw_ip: str | None) -> str:
+    normalized = " ".join(str(raw_ip or "").split())
+    return normalized.casefold() if normalized else "unknown"
+
+
+def extract_client_ip(request: FastAPIRequest) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def read_ip_histories_unlocked() -> dict[str, list[str]]:
     try:
-        history = get_global_history()
-        history = merge_names_recency_preserving(history, names)
-        GLOBAL_HISTORY_FILE.write_text(json.dumps(history), encoding="utf-8")
+        if IP_HISTORY_FILE.exists():
+            content = IP_HISTORY_FILE.read_text(encoding="utf-8").strip()
+            if content:
+                payload = json.loads(content)
+                if isinstance(payload, dict):
+                    histories: dict[str, list[str]] = {}
+                    for raw_ip, raw_names in payload.items():
+                        if not isinstance(raw_names, list):
+                            continue
+                        histories[normalize_client_ip(raw_ip)] = trim_fifo_names(
+                            merge_names_recency_preserving([], raw_names),
+                            IP_HISTORY_MAX_NAMES,
+                        )
+                    return histories
     except Exception as exc:
-        logger.error("Failed to update global history: %s", exc)
+        logger.error("Failed to read IP history: %s", exc)
+    return {}
+
+
+def write_ip_histories_unlocked(histories: dict[str, list[str]]) -> None:
+    normalized_histories: dict[str, list[str]] = {}
+    for raw_ip, raw_names in histories.items():
+        ip_key = normalize_client_ip(raw_ip)
+        if not ip_key:
+            continue
+        normalized_histories[ip_key] = trim_fifo_names(
+            merge_names_recency_preserving([], raw_names),
+            IP_HISTORY_MAX_NAMES,
+        )
+    IP_HISTORY_FILE.write_text(
+        json.dumps(normalized_histories, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+
+def get_ip_history(client_ip_key: str) -> list[str]:
+    with ip_history_lock:
+        histories = read_ip_histories_unlocked()
+        return list(histories.get(normalize_client_ip(client_ip_key), []))
+
+
+def update_ip_history(client_ip_key: str, names: list[str]) -> list[str]:
+    ip_key = normalize_client_ip(client_ip_key)
+    with ip_history_lock:
+        histories = read_ip_histories_unlocked()
+        history = merge_names_recency_preserving(histories.get(ip_key, []), names)
+        history = trim_fifo_names(history, IP_HISTORY_MAX_NAMES)
+        histories[ip_key] = history
+        write_ip_histories_unlocked(histories)
+        return list(history)
+
+
+def collect_ip_reserved_names(client_ip_key: str, exclude_session_id: str | None = None) -> list[str]:
+    reserved_names: list[str] = []
+    normalized_ip = normalize_client_ip(client_ip_key)
+    for session_id, session in sessions.items():
+        if exclude_session_id and session_id == exclude_session_id:
+            continue
+        if normalize_client_ip(session.get("client_ip_key")) != normalized_ip:
+            continue
+        reserved_names.extend(session.get("reserved_names", []))
+    return merge_names_recency_preserving([], reserved_names)
 
 
 def build_generation_prompt(
@@ -644,6 +875,7 @@ def build_generation_prompt(
 
 def build_candidate_selection_prompt(
     forbidden: list[str],
+    candidate_count: int,
     retry_notes: list[str] | None = None,
 ) -> str:
     if forbidden:
@@ -657,7 +889,7 @@ def build_candidate_selection_prompt(
         if deduped_notes:
             retry_section = "Retry notes:\n" + "\n".join(f"- {note}" for note in deduped_notes) + "\n\n"
 
-    prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
+    prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(candidate_count))
     return (
         "CRITICAL FORBIDDEN LIST:\n"
         f"[{forbidden_tail}]\n\n"
@@ -697,7 +929,10 @@ def build_retry_note(error_message: str) -> str:
     if "portrait placeholder" in error_message or "old image placeholder" in error_message:
         return (
             "Your previous attempt used the image slot incorrectly. "
-            f"Set the portrait `<img src>` to the exact literal `{PORTRAIT_IMAGE_PLACEHOLDER}`. Do not output a final remote image URL yourself, and if the reveal page also shows a portrait, reuse the same placeholder."
+            f"Use exactly one portrait `<img src>` with the exact literal `{PORTRAIT_IMAGE_PLACEHOLDER}`. "
+            "Do not place the placeholder in CSS `url(...)`, inline styles, text, data attributes, or extra `<img>` tags. "
+            "If you want a background-like portrait treatment, style that one `<img>` with layout classes and surrounding decorative `<div>` layers instead of repeating the placeholder. "
+            "Do not output a final remote image URL yourself, and if the reveal page also shows a portrait, reuse the same single-placeholder pattern there."
         )
     if "unsupported tailwind class" in error_message.lower():
         return (
@@ -1394,10 +1629,10 @@ def generate_with_modern_sdk(
             model=model_name,
             contents=prompt,
             config=modern_types.GenerateContentConfig(
-                temperature=GENERATION_TEMPERATURE,
-                topP=GENERATION_TOP_P,
+                temperature=ROUND_UI_TEMPERATURE,
+                topP=ROUND_UI_TOP_P,
                 candidateCount=1,
-                maxOutputTokens=GENERATION_MAX_OUTPUT_TOKENS,
+                maxOutputTokens=ROUND_UI_MAX_OUTPUT_TOKENS,
                 responseMimeType="application/json",
                 responseJsonSchema=GeneratedRound.model_json_schema(),
                 automaticFunctionCalling=modern_types.AutomaticFunctionCallingConfig(
@@ -1466,12 +1701,11 @@ def select_candidates_with_modern_sdk(
             model=model_name,
             contents=prompt,
             config=modern_types.GenerateContentConfig(
-                temperature=GENERATION_TEMPERATURE,
-                topP=GENERATION_TOP_P,
+                temperature=CANDIDATE_SELECTION_TEMPERATURE,
+                topP=CANDIDATE_SELECTION_TOP_P,
                 candidateCount=1,
                 maxOutputTokens=CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS,
                 responseMimeType="application/json",
-                responseJsonSchema=CandidateSelection.model_json_schema(),
                 automaticFunctionCalling=modern_types.AutomaticFunctionCallingConfig(
                     disable=True,
                 ),
@@ -1531,9 +1765,9 @@ def generate_with_legacy_sdk(
         response = model.generate_content(
             prompt,
             generation_config={
-                "temperature": GENERATION_TEMPERATURE,
-                "top_p": GENERATION_TOP_P,
-                "max_output_tokens": GENERATION_MAX_OUTPUT_TOKENS,
+                "temperature": ROUND_UI_TEMPERATURE,
+                "top_p": ROUND_UI_TOP_P,
+                "max_output_tokens": ROUND_UI_MAX_OUTPUT_TOKENS,
                 "response_mime_type": "application/json",
             },
         )
@@ -1591,8 +1825,8 @@ def select_candidates_with_legacy_sdk(
         response = model.generate_content(
             prompt,
             generation_config={
-                "temperature": GENERATION_TEMPERATURE,
-                "top_p": GENERATION_TOP_P,
+                "temperature": CANDIDATE_SELECTION_TEMPERATURE,
+                "top_p": CANDIDATE_SELECTION_TOP_P,
                 "max_output_tokens": CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS,
                 "response_mime_type": "application/json",
             },
@@ -1684,15 +1918,19 @@ def generate_round_candidate(
     return model_name, normalized
 
 
-def choose_allowed_candidate(
+def choose_allowed_candidates(
     selection: CandidateSelection,
     forbidden: list[str],
-) -> LockedCandidate:
+    limit: int,
+) -> tuple[list[LockedCandidate], list[str]]:
     forbidden_keys = {normalize_name_key(name) for name in forbidden}
     seen_keys: set[str] = set()
+    accepted: list[LockedCandidate] = []
     rejected_names: list[str] = []
 
     for candidate in selection.candidates:
+        if len(accepted) >= limit:
+            break
         person_name = " ".join(candidate.person_name.split())
         key = normalize_name_key(person_name)
         if not person_name:
@@ -1701,86 +1939,152 @@ def choose_allowed_candidate(
             rejected_names.append(person_name)
             continue
         seen_keys.add(key)
-        return LockedCandidate(
-            person_name=person_name,
-            actual_status=candidate.actual_status,
-            source="candidate_selection",
+        accepted.append(
+            LockedCandidate(
+                person_name=person_name,
+                actual_status=candidate.actual_status,
+                source="candidate_selection",
+            )
         )
 
-    rejected_tail = ", ".join(rejected_names[:12]) if rejected_names else "none"
-    raise ValueError(
-        f"Candidate selection returned no allowed person. Rejected candidates: {rejected_tail}"
-    )
+    return accepted, rejected_names
 
 
-def choose_emergency_fallback_candidate(forbidden: list[str]) -> LockedCandidate:
-    forbidden_order = {
-        normalize_name_key(name): index for index, name in enumerate(forbidden)
-    }
-    ranked_names = sorted(
-        EMERGENCY_FALLBACK_NAMES,
-        key=lambda name: (
-            0 if normalize_name_key(name) not in forbidden_order else 1,
-            forbidden_order.get(normalize_name_key(name), -1),
-            EMERGENCY_FALLBACK_NAMES.index(name),
-        ),
-    )
-    return LockedCandidate(
-        person_name=ranked_names[0],
-        actual_status=None,
-        source="emergency_fallback",
-    )
+def choose_reused_candidates_from_history(
+    ip_history: list[str],
+    selected: list[LockedCandidate],
+    limit: int,
+) -> list[LockedCandidate]:
+    selected_keys = {normalize_name_key(candidate.person_name) for candidate in selected}
+    reused: list[LockedCandidate] = []
+
+    for person_name in ip_history:
+        if len(reused) >= limit:
+            break
+        key = normalize_name_key(person_name)
+        if key in selected_keys:
+            continue
+        selected_keys.add(key)
+        reused.append(
+            LockedCandidate(
+                person_name=person_name,
+                actual_status=None,
+                source="ip_history_reuse",
+            )
+        )
+
+    return reused
 
 
-def should_use_emergency_fallback(error_message: str) -> bool:
-    normalized = error_message.casefold()
-    return (
-        "candidate selection returned no allowed person" in normalized
-        or "all candidate-selection models failed" in normalized
-    )
-
-
-def select_allowed_candidate_sync(
+def negotiate_round_candidates_sync(
     forbidden: list[str],
+    ip_history: list[str],
     model_candidates: list[str],
-    retry_notes: list[str],
+    pool_size: int,
     audit_meta: dict[str, object],
-) -> tuple[str, LockedCandidate]:
-    prompt = build_candidate_selection_prompt(forbidden, retry_notes)
+) -> tuple[str, list[LockedCandidate]]:
+    working_forbidden = list(dict.fromkeys(forbidden))
+    retry_notes: list[str] = []
     errors: list[str] = []
+    approved: list[LockedCandidate] = []
+    last_successful_model: str | None = None
 
-    for model_name in model_candidates:
-        try:
-            if modern_genai is not None:
-                selection = select_candidates_with_modern_sdk(model_name, prompt, audit_meta)
-            else:
-                selection = select_candidates_with_legacy_sdk(model_name, prompt, audit_meta)
-            candidate = choose_allowed_candidate(selection, forbidden)
+    for attempt in range(SESSION_NEGOTIATION_ATTEMPTS):
+        if len(approved) >= pool_size:
+            break
+
+        prompt = build_candidate_selection_prompt(
+            working_forbidden,
+            CANDIDATE_SELECTION_COUNT,
+            retry_notes,
+        )
+        accepted_this_attempt = 0
+
+        for model_name in model_candidates:
+            try:
+                if modern_genai is not None:
+                    selection = select_candidates_with_modern_sdk(model_name, prompt, audit_meta)
+                else:
+                    selection = select_candidates_with_legacy_sdk(model_name, prompt, audit_meta)
+                candidates, rejected_names = choose_allowed_candidates(
+                    selection,
+                    working_forbidden,
+                    pool_size - len(approved),
+                )
+                if not candidates:
+                    rejected_tail = ", ".join(rejected_names[:12]) if rejected_names else "none"
+                    raise ValueError(
+                        "Candidate negotiation returned no newly allowed people. "
+                        f"Rejected candidates: {rejected_tail}"
+                    )
+
+                approved.extend(candidates)
+                working_forbidden.extend(candidate.person_name for candidate in candidates)
+                working_forbidden = list(dict.fromkeys(working_forbidden))
+                accepted_this_attempt += len(candidates)
+                last_successful_model = model_name
+                append_gemini_audit_log(
+                    "gemini.candidate_selection_result",
+                    model=model_name,
+                    status="accepted",
+                    accepted_count=len(candidates),
+                    person_names=[candidate.person_name for candidate in candidates],
+                    **audit_meta,
+                )
+                if len(approved) >= pool_size:
+                    return last_successful_model, approved
+            except Exception as exc:
+                append_gemini_audit_log(
+                    "gemini.candidate_selection_result",
+                    model=model_name,
+                    status="rejected",
+                    error=str(exc),
+                    **audit_meta,
+                )
+                logger.warning("Candidate negotiation failed for %s: %s", model_name, exc)
+                errors.append(f"{model_name} negotiation attempt {attempt + 1}: {exc}")
+
+        remaining = pool_size - len(approved)
+        if remaining <= 0:
+            break
+        if accepted_this_attempt == 0:
+            retry_notes.append(
+                "Your previous candidate batch still reused forbidden or duplicate people. "
+                "Go deeper and return a more diverse set of definitely different celebrities."
+            )
+        retry_notes.append(
+            f"You still need to return {remaining} more unique allowed celebrities that are not in the forbidden list."
+        )
+        retry_notes = list(dict.fromkeys(retry_notes))
+
+    if len(approved) < pool_size:
+        reused = choose_reused_candidates_from_history(
+            ip_history,
+            approved,
+            pool_size - len(approved),
+        )
+        if reused:
+            approved.extend(reused)
             append_gemini_audit_log(
-                "gemini.candidate_selection_result",
-                model=model_name,
-                status="accepted",
-                person_name=candidate.person_name,
-                actual_status=candidate.actual_status,
+                "gemini.candidate_selection_reuse",
+                status="used",
+                person_names=[candidate.person_name for candidate in reused],
+                reused_count=len(reused),
                 **audit_meta,
             )
-            return model_name, candidate
-        except Exception as exc:
-            append_gemini_audit_log(
-                "gemini.candidate_selection_result",
-                model=model_name,
-                status="rejected",
-                error=str(exc),
-                **audit_meta,
-            )
-            logger.warning("Candidate selection failed for %s: %s", model_name, exc)
-            errors.append(f"{model_name}: {exc}")
 
-    raise RuntimeError("All candidate-selection models failed. " + " | ".join(errors))
+    if len(approved) >= pool_size:
+        return last_successful_model or "ip_history_reuse", approved
+
+    error_tail = " | ".join(errors) if errors else "insufficient approved candidates"
+    raise RuntimeError(
+        "Unable to negotiate enough round candidates for this IP. " + error_tail
+    )
 
 
 def generate_single_round_sync(
     forbidden: list[str],
+    locked_candidate: LockedCandidate,
     model_candidates: list[str],
     race_models: bool = False,
 ) -> tuple[str, dict]:
@@ -1788,7 +2092,11 @@ def generate_single_round_sync(
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
 
     errors = []
-    working_forbidden = list(dict.fromkeys(forbidden))
+    working_forbidden = [
+        name
+        for name in list(dict.fromkeys(forbidden))
+        if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
+    ]
     retry_notes: list[str] = []
 
     for attempt in range(ROUND_GENERATION_ATTEMPTS):
@@ -1797,45 +2105,8 @@ def generate_single_round_sync(
             "attempt": attempt + 1,
             "audit_request_id": audit_request_id,
         }
-        locked_candidate: LockedCandidate | None = None
-        try:
-            _, locked_candidate = select_allowed_candidate_sync(
-                working_forbidden,
-                model_candidates,
-                retry_notes,
-                audit_meta,
-            )
-        except Exception as exc:
-            errors.append(f"candidate selection attempt {attempt + 1}: {exc}")
-            retry_notes.append(build_retry_note(str(exc)))
-            retry_notes = list(dict.fromkeys(retry_notes))
-            if should_use_emergency_fallback(str(exc)):
-                locked_candidate = choose_emergency_fallback_candidate(working_forbidden)
-                append_gemini_audit_log(
-                    "gemini.candidate_selection_fallback",
-                    status="used",
-                    person_name=locked_candidate.person_name,
-                    source=locked_candidate.source,
-                    reason=str(exc),
-                    **audit_meta,
-                )
-                logger.warning(
-                    "Using emergency fallback candidate %s after candidate-selection failure on attempt %s: %s",
-                    locked_candidate.person_name,
-                    attempt + 1,
-                    exc,
-                )
-            else:
-                continue
-
-        generation_forbidden = [
-            name
-            for name in working_forbidden
-            if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
-        ]
-
         prompt = build_generation_prompt(
-            generation_forbidden,
+            working_forbidden,
             retry_notes,
             locked_person_name=locked_candidate.person_name,
             locked_actual_status=locked_candidate.actual_status,
@@ -1852,7 +2123,7 @@ def generate_single_round_sync(
                         generate_round_candidate,
                         model_name,
                         prompt,
-                        generation_forbidden,
+                        working_forbidden,
                         audit_meta | {"race_mode": True},
                         locked_candidate.person_name,
                         locked_candidate.actual_status,
@@ -1885,7 +2156,7 @@ def generate_single_round_sync(
                 return generate_round_candidate(
                     model_name,
                     prompt,
-                    generation_forbidden,
+                    working_forbidden,
                     audit_meta | {"race_mode": False},
                     locked_candidate.person_name,
                     locked_candidate.actual_status,
@@ -1937,7 +2208,7 @@ def render_finale_html(session: dict) -> str:
             {history_list}
         </div>
         <div class='mt-10 flex justify-center'>
-            <button onclick='location.reload()' class='rounded-full bg-white px-10 py-4 text-lg font-black uppercase tracking-[0.2em] text-black transition hover:scale-105 active:scale-95'>
+            <button onclick='startGame()' class='rounded-full bg-white px-10 py-4 text-lg font-black uppercase tracking-[0.2em] text-black transition hover:scale-105 active:scale-95'>
                 Play Again
             </button>
         </div>
@@ -1947,6 +2218,7 @@ def render_finale_html(session: dict) -> str:
 
 def collect_session_reserved_names(session: dict) -> list[str]:
     reserved_names: list[str] = []
+    reserved_names.extend(session.get("reserved_names", []))
     reserved_names.extend(session.get("used_names", []))
     active_round = session.get("active_round") or {}
     if active_round.get("person_name"):
@@ -1960,19 +2232,48 @@ def collect_session_reserved_names(session: dict) -> list[str]:
     return merge_names_recency_preserving([], reserved_names)
 
 
+def get_session_round_candidate(session: dict, target_round_number: int) -> LockedCandidate:
+    round_candidates = session.get("round_candidates", [])
+    index = target_round_number - 1
+    if index < 0 or index >= len(round_candidates):
+        raise RuntimeError(f"No negotiated candidate available for round {target_round_number}")
+
+    candidate_data = round_candidates[index]
+    return LockedCandidate(
+        person_name=str(candidate_data["person_name"]),
+        actual_status=candidate_data.get("actual_status"),
+        source=str(candidate_data.get("source", "candidate_selection")),
+    )
+
+
+def build_round_generation_forbidden(
+    session: dict,
+    locked_candidate: LockedCandidate,
+) -> list[str]:
+    forbidden: list[str] = []
+    forbidden.extend(get_ip_history(session.get("client_ip_key", "unknown")))
+    forbidden.extend(collect_ip_reserved_names(session.get("client_ip_key", "unknown")))
+    forbidden.extend(collect_session_reserved_names(session))
+    forbidden = merge_names_recency_preserving([], forbidden)
+    return [
+        name
+        for name in forbidden
+        if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
+    ]
+
+
 async def generate_round_payload(
     session: dict,
     target_round_number: int,
     model_candidates: list[str],
     race_models: bool = False,
 ) -> tuple[str, dict]:
-    forbidden = collect_session_reserved_names(session)
-    if GLOBAL_HISTORY_PROMPT_LIMIT > 0:
-        forbidden.extend(get_global_history()[-GLOBAL_HISTORY_PROMPT_LIMIT:])
-    forbidden = merge_names_recency_preserving([], forbidden)
+    locked_candidate = get_session_round_candidate(session, target_round_number)
+    forbidden = build_round_generation_forbidden(session, locked_candidate)
     model_name, round_data = await asyncio.to_thread(
         generate_single_round_sync,
         forbidden,
+        locked_candidate,
         model_candidates,
         race_models,
     )
@@ -1982,7 +2283,6 @@ async def generate_round_payload(
     )
     runtime_state["last_model"] = model_name
     runtime_state["last_error"] = None
-    update_global_history([round_data["person_name"]])
     logger.info("Generated round %s using %s", target_round_number, model_name)
     return model_name, round_data
 
@@ -2226,9 +2526,10 @@ async def index():
             }}
 
             async function startGame() {{
+                sessionId = null;
                 renderLoader(
-                    'Designing Round One',
-                    'Gemini is generating the first challenge in real time.'
+                    'Identifying Your Celebrities',
+                    'The game is negotiating your celebrity pool and building round one. The game will start momentarily.'
                 );
 
                 try {{
@@ -2300,26 +2601,58 @@ async def status():
         "gemini_audit_log_file": str(GEMINI_AUDIT_LOG_FILE),
         "image_url_validation_enabled": IMAGE_URL_VALIDATION_ENABLED,
         "wikimedia_search_timeout_seconds": WIKIMEDIA_SEARCH_TIMEOUT_SECONDS,
+        "repeat_history_scope": "per_ip_fifo",
+        "ip_history_max_names": IP_HISTORY_MAX_NAMES,
+        "session_candidate_count": SESSION_APPROVED_POOL_SIZE,
         "image_contract": "backend_wikimedia_query_resolution",
     }
 
 
 @app.post("/api/start-session")
-async def start_session():
+async def start_session(request: FastAPIRequest):
     session_id = str(uuid.uuid4())
-    session = {
-        "score": 0,
-        "round_number": 0,
-        "history": [],
-        "used_names": [],
-        "active_round": None,
-        "queued_rounds": [],
-        "prefetch_task": None,
-        "prefetch_error": None,
-    }
-    sessions[session_id] = session
+    client_ip_key = normalize_client_ip(extract_client_ip(request))
+    ip_history = get_ip_history(client_ip_key)
+    forbidden = merge_names_recency_preserving(
+        ip_history,
+        collect_ip_reserved_names(client_ip_key),
+    )
 
     try:
+        _, round_candidates = await asyncio.to_thread(
+            negotiate_round_candidates_sync,
+            forbidden,
+            ip_history,
+            FAST_MODEL_CANDIDATES,
+            max(SESSION_APPROVED_POOL_SIZE, ROUNDS_PER_GAME),
+            {
+                "session_id": session_id,
+                "client_ip_key": client_ip_key,
+            },
+        )
+        reserved_names = [candidate.person_name for candidate in round_candidates]
+        update_ip_history(client_ip_key, reserved_names)
+        session = {
+            "client_ip_key": client_ip_key,
+            "score": 0,
+            "round_number": 0,
+            "history": [],
+            "used_names": [],
+            "reserved_names": reserved_names,
+            "round_candidates": [
+                {
+                    "person_name": candidate.person_name,
+                    "actual_status": candidate.actual_status,
+                    "source": candidate.source,
+                }
+                for candidate in round_candidates
+            ],
+            "active_round": None,
+            "queued_rounds": [],
+            "prefetch_task": None,
+            "prefetch_error": None,
+        }
+        sessions[session_id] = session
         round_data = await generate_round_for_session(
             session,
             1,
