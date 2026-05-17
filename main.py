@@ -123,7 +123,7 @@ RACE_FAST_MODELS = os.getenv("RACE_FAST_MODELS", "true").lower() == "true"
 PERF_LOG_ENABLED = os.getenv("PERF_LOG_ENABLED", "true").lower() == "true"
 GEMINI_AUDIT_LOG_ENABLED = os.getenv("GEMINI_AUDIT_LOG_ENABLED", "true").lower() == "true"
 IMAGE_URL_VALIDATION_ENABLED = os.getenv("IMAGE_URL_VALIDATION_ENABLED", "true").lower() == "true"
-STATUS_VALIDATION_ENABLED = os.getenv("STATUS_VALIDATION_ENABLED", "true").lower() == "true"
+STATUS_VALIDATION_ENABLED = os.getenv("STATUS_VALIDATION_ENABLED", "false").lower() == "true"
 PORTRAIT_FALLBACK_MODE = os.getenv("PORTRAIT_FALLBACK_MODE", "prefer_real").strip().lower()
 IMAGE_URL_VALIDATION_TIMEOUT_SECONDS = float(
     os.getenv("IMAGE_URL_VALIDATION_TIMEOUT_SECONDS", "4.0")

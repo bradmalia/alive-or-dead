@@ -79,8 +79,8 @@ These are local runtime artifacts. They are excluded from deploy syncs and may c
 
 ## Status Validation Toggle
 
-- `STATUS_VALIDATION_ENABLED=true` by default.
-- When enabled, Python performs a best-effort Wikipedia/Wikidata status verification pass before round generation and can override the negotiated status before sending the locked candidate to Gemini.
+- `STATUS_VALIDATION_ENABLED=false` by default.
+- Set `STATUS_VALIDATION_ENABLED=true` to enable a best-effort Wikipedia/Wikidata status verification pass before round generation.
 - When disabled, Python skips the Wikipedia/Wikidata verification pass and relies on the generated round payload for `actual_status`, `date_of_birth`, and `date_of_death`.
 
 ## Portrait Fallback Behavior
