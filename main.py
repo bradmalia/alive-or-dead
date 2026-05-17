@@ -519,6 +519,7 @@ class GeneratedRound(BaseModel):
     date_of_birth: str = Field(min_length=10, max_length=10)
     date_of_death: str | None = Field(default=None, min_length=10, max_length=10)
     portrait_search_query: str = Field(min_length=3, max_length=200)
+    next_round_label: str = Field(default="Next Round", max_length=80)
     guessing_ui_html: str = Field(min_length=50, max_length=5000)
     reveal_ui_html: str = Field(min_length=50, max_length=5000)
 
@@ -559,6 +560,13 @@ class GeneratedRound(BaseModel):
         if not ISO_DATE_RE.fullmatch(value):
             raise ValueError("date_of_death must use YYYY-MM-DD format")
         datetime.strptime(value, "%Y-%m-%d")
+        return value
+
+    @field_validator("next_round_label", mode="before")
+    @classmethod
+    def normalize_next_round_label(cls, value):
+        if isinstance(value, str):
+            return " ".join(value.split())
         return value
 
     @model_validator(mode="after")
@@ -796,6 +804,7 @@ Return only raw JSON with:
 - `date_of_birth`
 - `date_of_death`
 - `portrait_search_query`
+- `next_round_label`
 - `guessing_ui_html`
 - `reveal_ui_html`
 
@@ -820,6 +829,8 @@ Round requirements:
   - `submitGuess('alive')` and `submitGuess('dead')` buttons
 - The reveal page must match the same theme and include `loadNextRound()`.
 - The reveal page should include a compact factual date reference using the returned date fields, especially for the verdict moment, and should display those dates in a human-readable format like `April 5th, 2006` rather than raw ISO strings.
+- Return `next_round_label` as a short, creative, celebrity-specific label for the `loadNextRound()` button. It should feel tailored to the subject's world, such as a catchphrase, encore, sequel cue, or related phrase, and should stay concise.
+- The reveal page button text should use `next_round_label` exactly, not a generic `Next Round` label.
 
 Output rules:
 - Tailwind classes only. No <script>, <style>, <html>, <body>, <head>, markdown fences, SVG data URIs, or base64.
@@ -1522,40 +1533,54 @@ def humanize_reveal_dates(fragment: str, date_of_birth: str, date_of_death: str 
 
 
 NEXT_ROUND_BUTTON_RE = re.compile(
-    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>",
-    re.IGNORECASE,
+    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
-def mobile_hide_next_round_button(fragment: str) -> str:
+def sanitize_next_round_label(label: str | None) -> str:
+    normalized = " ".join(str(label or "").split())
+    normalized = html.escape(normalized or "Next Round", quote=False)
+    if len(normalized) > 80:
+        normalized = normalized[:80].rstrip()
+    return normalized or "Next Round"
+
+
+def add_classes_to_attrs(attrs: str, extra_classes: str) -> str:
+    class_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.IGNORECASE | re.DOTALL)
+    if class_match:
+        quote = class_match.group(1)
+        existing_classes = class_match.group(2).strip()
+        combined_classes = " ".join(
+            part for part in (existing_classes, extra_classes.strip()) if part
+        )
+        replacement = f'class={quote}{combined_classes}{quote}'
+        return attrs[: class_match.start()] + replacement + attrs[class_match.end() :]
+    return f"{attrs} class=\"{extra_classes.strip()}\""
+
+
+def rewrite_next_round_control(fragment: str, label: str, hide_on_mobile: bool = False) -> str:
+    button_label = sanitize_next_round_label(label)
+
     def repl(match: re.Match[str]) -> str:
         tag = match.group("tag")
         attrs = match.group("attrs")
-        quote = match.group("q")
-        if re.search(r"\bclass\s*=\s*(['\"])", attrs, re.IGNORECASE):
-            return re.sub(
-                r"\bclass\s*=\s*(['\"])(.*?)\1",
-                lambda class_match: (
-                    f'class={class_match.group(1)}hidden md:inline-flex '
-                    f"{class_match.group(2).strip()}{class_match.group(1)}"
-                ),
-                f"<{tag}{attrs}>",
-                count=1,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-        return f"<{tag}{attrs} class={quote}hidden md:inline-flex{quote}>"
+        if hide_on_mobile:
+            attrs = add_classes_to_attrs(attrs, "hidden md:inline-flex")
+        return f"<{tag}{attrs}>{button_label}</{tag}>"
 
     return NEXT_ROUND_BUTTON_RE.sub(repl, fragment, count=1)
 
 
-def build_mobile_next_round_bar() -> str:
+def build_mobile_next_round_bar(label: str) -> str:
+    button_label = sanitize_next_round_label(label)
     return (
         "<div class='fixed inset-x-0 bottom-0 z-50 flex justify-center px-4 pb-4 pt-3 md:hidden' "
         "style='padding-bottom: calc(1rem + env(safe-area-inset-bottom));'>"
         "<div class='pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black via-black/80 to-transparent'></div>"
         "<button onclick=\"loadNextRound()\" "
         "class='pointer-events-auto relative rounded-full border border-white/10 bg-white px-6 py-4 text-sm font-black uppercase tracking-[0.2em] text-black shadow-2xl shadow-black/40 transition hover:scale-105 active:scale-95'>"
-        "Next Round"
+        f"{button_label}"
         "</button>"
         "</div>"
     )
@@ -2666,7 +2691,12 @@ def normalize_round(
         round_item.date_of_birth,
         round_item.date_of_death,
     )
-    reveal_ui_html = mobile_hide_next_round_button(reveal_ui_html)
+    next_round_label = sanitize_next_round_label(round_item.next_round_label)
+    reveal_ui_html = rewrite_next_round_control(
+        reveal_ui_html,
+        next_round_label,
+        hide_on_mobile=True,
+    )
     validate_embedded_image_urls(guessing_ui_html, person_name, "Guessing", require_image=True)
     validate_embedded_image_urls(reveal_ui_html, person_name, "Reveal")
 
@@ -2675,6 +2705,7 @@ def normalize_round(
         "actual_status": round_item.actual_status,
         "date_of_birth": round_item.date_of_birth,
         "date_of_death": round_item.date_of_death,
+        "next_round_label": next_round_label,
         "guessing_ui_html": guessing_ui_html,
         "reveal_ui_html": reveal_ui_html,
     }
@@ -4187,7 +4218,11 @@ async def guess(request: FastAPIRequest):
         "</div>"
         "</div>"
     )
-    return {"reveal_ui_html": injection + round_data["reveal_ui_html"] + build_mobile_next_round_bar()}
+    return {
+        "reveal_ui_html": injection
+        + round_data["reveal_ui_html"]
+        + build_mobile_next_round_bar(round_data.get("next_round_label", "Next Round"))
+    }
 
 
 if __name__ == "__main__":
