@@ -1521,6 +1521,33 @@ def humanize_reveal_dates(fragment: str, date_of_birth: str, date_of_death: str 
     return rewritten
 
 
+NEXT_ROUND_BUTTON_RE = re.compile(
+    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>",
+    re.IGNORECASE,
+)
+
+
+def mobile_hide_next_round_button(fragment: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        tag = match.group("tag")
+        attrs = match.group("attrs")
+        quote = match.group("q")
+        if re.search(r"\bclass\s*=\s*(['\"])", attrs, re.IGNORECASE):
+            return re.sub(
+                r"\bclass\s*=\s*(['\"])(.*?)\1",
+                lambda class_match: (
+                    f'class={class_match.group(1)}hidden md:inline-flex '
+                    f"{class_match.group(2).strip()}{class_match.group(1)}"
+                ),
+                f"<{tag}{attrs}>",
+                count=1,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        return f"<{tag}{attrs} class={quote}hidden md:inline-flex{quote}>"
+
+    return NEXT_ROUND_BUTTON_RE.sub(repl, fragment, count=1)
+
+
 def build_mobile_next_round_bar() -> str:
     return (
         "<div class='fixed inset-x-0 bottom-0 z-50 flex justify-center px-4 pb-4 pt-3 md:hidden' "
@@ -2639,6 +2666,7 @@ def normalize_round(
         round_item.date_of_birth,
         round_item.date_of_death,
     )
+    reveal_ui_html = mobile_hide_next_round_button(reveal_ui_html)
     validate_embedded_image_urls(guessing_ui_html, person_name, "Guessing", require_image=True)
     validate_embedded_image_urls(reveal_ui_html, person_name, "Reveal")
 
