@@ -62,7 +62,7 @@ The workflow:
 ## Gemini Audit Log
 
 - Gemini prompt/response audit events are written to `gemini_audit.jsonl` in the project root by default.
-- Each JSONL entry records the exact prompt text, model, SDK, raw `response_text`, portrait-resolution events, and whether the round was accepted or rejected.
+- Each JSONL entry records the exact prompt text, model, SDK, raw `response_text`, portrait-resolution events, persisted `perf` timing events, and whether the round was accepted or rejected.
 - Set `GEMINI_AUDIT_LOG_ENABLED=false` to disable it.
 - Set `GEMINI_AUDIT_LOG_FILE=/custom/path/gemini_audit.jsonl` to change the log location.
 

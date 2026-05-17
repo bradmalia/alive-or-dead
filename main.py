@@ -370,20 +370,25 @@ COMMONS_CANDIDATE_PENALTIES = (
     ("concert", -2),
 )
 NON_PHOTO_TITLE_KEYWORDS = {
+    "album",
     "artwork",
     "caricature",
     "cartoon",
+    "cover",
     "drawing",
     "illustration",
     "mural",
     "painting",
+    "logo",
     "poster",
     "sculpture",
     "sketch",
+    "svg",
     "statue",
     "tableau",
     "tape",
     "wax",
+    "wordmark",
 }
 NON_PERSON_PAGE_KEYWORDS = {
     "aircraft",
@@ -706,6 +711,8 @@ def log_perf(stage: str, started_at: float, **fields) -> float:
     if PERF_LOG_ENABLED:
         payload = {"stage": stage, "duration_ms": duration_ms, **fields}
         logger.info("perf %s", json.dumps(payload, sort_keys=True, default=str))
+        if GEMINI_AUDIT_LOG_ENABLED:
+            append_gemini_audit_log("perf", **payload)
     return duration_ms
 
 
@@ -2634,6 +2641,9 @@ def resolve_wikimedia_portrait_url(
                         image_meta.get("thumbmime") or image_meta.get("mime") or ""
                     ).casefold()
                     if thumb_mime and not thumb_mime.startswith("image/"):
+                        continue
+                    original_mime = str(image_meta.get("mime") or "").casefold()
+                    if original_mime == "image/svg+xml":
                         continue
                     try:
                         validate_image_url_reachable(
