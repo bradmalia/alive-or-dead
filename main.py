@@ -123,7 +123,7 @@ RACE_FAST_MODELS = os.getenv("RACE_FAST_MODELS", "true").lower() == "true"
 PERF_LOG_ENABLED = os.getenv("PERF_LOG_ENABLED", "true").lower() == "true"
 GEMINI_AUDIT_LOG_ENABLED = os.getenv("GEMINI_AUDIT_LOG_ENABLED", "true").lower() == "true"
 IMAGE_URL_VALIDATION_ENABLED = os.getenv("IMAGE_URL_VALIDATION_ENABLED", "true").lower() == "true"
-STATUS_VALIDATION_ENABLED = os.getenv("STATUS_VALIDATION_ENABLED", "false").lower() == "true"
+STATUS_VALIDATION_ENABLED = os.getenv("STATUS_VALIDATION_ENABLED", "true").lower() == "true"
 PORTRAIT_FALLBACK_MODE = os.getenv("PORTRAIT_FALLBACK_MODE", "prefer_real").strip().lower()
 IMAGE_URL_VALIDATION_TIMEOUT_SECONDS = float(
     os.getenv("IMAGE_URL_VALIDATION_TIMEOUT_SECONDS", "4.0")
@@ -2308,7 +2308,10 @@ def resolve_person_actual_status(person_name: str) -> str | None:
         )
         for page in ranked_pages:
             title = str(page.get("title", "")).strip()
+            description = str(page.get("description", "")).strip()
             if not title or title_looks_non_biographical(title):
+                continue
+            if page_looks_non_person(title, description):
                 continue
             matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
             if not matches_person and not normalize_identity_text(title).startswith(
