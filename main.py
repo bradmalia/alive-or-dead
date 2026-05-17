@@ -1529,6 +1529,13 @@ def build_retry_note(error_message: str) -> str:
     )
 
 
+def trim_retry_notes(retry_notes: list[str], limit: int = 4) -> list[str]:
+    deduped = list(dict.fromkeys(note.strip() for note in retry_notes if note.strip()))
+    if limit <= 0:
+        return []
+    return deduped[-limit:]
+
+
 def extract_visible_text(fragment: str) -> str:
     text = HTML_TAG_RE.sub(" ", fragment)
     return WHITESPACE_RE.sub(" ", text).strip()
@@ -1886,7 +1893,7 @@ def validate_guess_button_layout(fragment: str, person_name: str) -> None:
         ancestor = guess_node
         depth = 0
         while ancestor.parent is not None:
-            if depth <= 2 and node_uses_button_overlay_classes(ancestor):
+            if depth <= 1 and node_uses_button_overlay_classes(ancestor):
                 raise ValueError(
                     f"Guessing UI places guess buttons over the portrait for {person_name}: overlay positioning utilities detected"
                 )
@@ -3373,7 +3380,7 @@ def generate_single_round_sync(
             "audit_request_id": audit_request_id,
         }
         prompt = build_generation_prompt(
-            retry_notes,
+            trim_retry_notes(retry_notes),
             locked_person_name=locked_candidate.person_name,
             locked_actual_status=locked_candidate.actual_status,
         )
@@ -3442,9 +3449,12 @@ def generate_single_round_sync(
                 if str(exc).startswith("Model returned forbidden person:"):
                     working_forbidden.append(str(exc).split(": ", 1)[1])
                 retry_notes.append(build_retry_note(str(exc)))
-                retry_notes = list(dict.fromkeys(retry_notes))
+                retry_notes = trim_retry_notes(retry_notes)
 
-    raise RuntimeError("All configured Gemini models failed. " + " | ".join(errors))
+    error_tail = " | ".join(errors)
+    if should_skip_candidate_on_generation_failure(error_tail):
+        raise CandidatePortraitUnavailableError(error_tail)
+    raise RuntimeError("All configured Gemini models failed. " + error_tail)
 
 
 def render_history_item(entry: dict) -> str:
@@ -3595,6 +3605,28 @@ def should_skip_candidate_on_portrait_failure(error_message: str) -> bool:
     return (
         "no valid wikimedia portrait found" in lowered
         or "portrait_search_query resolution failed" in lowered
+    )
+
+
+def should_skip_candidate_on_generation_failure(error_message: str) -> bool:
+    lowered = error_message.lower()
+    return (
+        should_skip_candidate_on_portrait_failure(error_message)
+        or "guessing ui places guess buttons over the portrait" in lowered
+        or "guessing ui is missing guess buttons" in lowered
+        or "reveal ui is missing next-round button" in lowered
+        or "guessing ui includes spoiler wording" in lowered
+        or "unsupported tailwind class" in lowered
+        or "portrait placeholder" in lowered
+        or "old image placeholder" in lowered
+        or "returned non-json output" in lowered
+        or "returned non-json candidate-selection output" in lowered
+        or "json extraction failed" in lowered
+        or "model returned forbidden person:" in lowered
+        or "locked person" in lowered
+        or "locked status" in lowered
+        or "date_of_birth" in lowered
+        or "date_of_death" in lowered
     )
 
 
