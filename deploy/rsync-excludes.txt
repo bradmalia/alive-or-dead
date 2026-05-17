@@ -8,3 +8,7 @@ venv/
 gemini_audit.jsonl
 game_queue.json
 global_history.json
+ip_history.json
+ip_candidate_pools.json
+candidate_bank.json
+portrait_resolution_cache.json
