@@ -84,6 +84,7 @@ def app_path(path: str) -> str:
 
 APP_VERSION = "3.6.2"
 APP_BASE_PATH = normalize_app_base_path(os.getenv("APP_BASE_PATH", ""))
+CURRENT_YEAR = datetime.now(timezone.utc).year
 ROUNDS_PER_GAME = 10
 ROUND_GENERATION_ATTEMPTS = int(os.getenv("ROUND_GENERATION_ATTEMPTS", "3"))
 PREFETCH_ROUND_BUFFER = int(os.getenv("PREFETCH_ROUND_BUFFER", "2"))
@@ -119,6 +120,14 @@ CANDIDATE_SELECTION_TOP_P = float(
 CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS = int(
     os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "4500")
 )
+PLAUSIBLE_CANDIDATE_MIN_AGE = int(
+    os.getenv("PLAUSIBLE_CANDIDATE_MIN_AGE", "8")
+)
+PLAUSIBLE_CANDIDATE_MAX_AGE = int(
+    os.getenv("PLAUSIBLE_CANDIDATE_MAX_AGE", "120")
+)
+PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR = CURRENT_YEAR - PLAUSIBLE_CANDIDATE_MAX_AGE
+PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR = CURRENT_YEAR - PLAUSIBLE_CANDIDATE_MIN_AGE
 RACE_FAST_MODELS = os.getenv("RACE_FAST_MODELS", "true").lower() == "true"
 PERF_LOG_ENABLED = os.getenv("PERF_LOG_ENABLED", "true").lower() == "true"
 GEMINI_AUDIT_LOG_ENABLED = os.getenv("GEMINI_AUDIT_LOG_ENABLED", "true").lower() == "true"
@@ -695,6 +704,8 @@ portrait_resolution_cache: dict[tuple[str, str], tuple[bool, str]] = {}
 portrait_resolution_lock = threading.Lock()
 status_resolution_cache: dict[str, str | None] = {}
 status_resolution_lock = threading.Lock()
+candidate_plausibility_cache: dict[str, bool | None] = {}
+candidate_plausibility_lock = threading.Lock()
 ip_history_lock = threading.Lock()
 candidate_ip_pool_lock = threading.Lock()
 candidate_bank_lock = threading.Lock()
@@ -947,7 +958,9 @@ Candidate rules:
   - `person_name`
   - `actual_status`
 - `actual_status` must be exactly `alive` or `dead`. Never use `deceased`, `passed away`, `late`, or any other synonym.
-- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable.
+- Pick famous people whose birth year is between [MIN_BIRTH_YEAR] and [MAX_BIRTH_YEAR], so their age would plausibly be between [MIN_AGE] and [MAX_AGE] years old today.
+- Do not return historical figures, ancient celebrities, or anyone obviously far outside that birth-year window.
+- Their status should still feel genuinely guessable to a modern player.
 - Never return anyone from the forbidden list in the user prompt.
 - Use canonical common public names only.
 - Do not include duplicate people, aliases of the same person, or close variants of the same name.
@@ -1197,6 +1210,7 @@ def select_candidates_from_ip_pool(client_ip_key: str, forbidden: list[str], lim
     forbidden_keys = {normalize_name_key(name) for name in forbidden}
     selected: list[LockedCandidate] = []
     selected_keys: set[str] = set()
+    rejected_names: list[str] = []
     with candidate_ip_pool_lock:
         pools = read_ip_candidate_pools_unlocked()
         entries = list(pools.get(ip_key, []))
@@ -1206,6 +1220,10 @@ def select_candidates_from_ip_pool(client_ip_key: str, forbidden: list[str], lim
         actual_status = str(entry.get("actual_status", "")).strip().lower() or None
         key = normalize_name_key(person_name)
         if not person_name or key in forbidden_keys or key in selected_keys:
+            continue
+        plausible = resolve_candidate_age_plausibility(person_name)
+        if plausible is False:
+            rejected_names.append(person_name)
             continue
         selected_keys.add(key)
         selected.append(
@@ -1217,6 +1235,9 @@ def select_candidates_from_ip_pool(client_ip_key: str, forbidden: list[str], lim
         )
         if len(selected) >= limit:
             break
+
+    for person_name in rejected_names:
+        forget_candidate_from_ip_pool(ip_key, person_name)
 
     return selected
 
@@ -1298,6 +1319,7 @@ def select_candidates_from_bank(forbidden: list[str], limit: int) -> list[Locked
     forbidden_keys = {normalize_name_key(name) for name in forbidden}
     selected: list[LockedCandidate] = []
     selected_keys: set[str] = set()
+    rejected_names: list[str] = []
     with candidate_bank_lock:
         entries = read_candidate_bank_unlocked()
 
@@ -1306,6 +1328,10 @@ def select_candidates_from_bank(forbidden: list[str], limit: int) -> list[Locked
         actual_status = str(entry.get("actual_status", "")).strip().lower() or None
         key = normalize_name_key(person_name)
         if not person_name or key in forbidden_keys or key in selected_keys:
+            continue
+        plausible = resolve_candidate_age_plausibility(person_name)
+        if plausible is False:
+            rejected_names.append(person_name)
             continue
         selected_keys.add(key)
         selected.append(
@@ -1317,6 +1343,9 @@ def select_candidates_from_bank(forbidden: list[str], limit: int) -> list[Locked
         )
         if len(selected) >= limit:
             break
+
+    for person_name in rejected_names:
+        forget_candidate_from_bank(person_name)
 
     return selected
 
@@ -1449,7 +1478,14 @@ def build_candidate_selection_prompt(
         if deduped_notes:
             retry_section = "Retry notes:\n" + "\n".join(f"- {note}" for note in deduped_notes) + "\n\n"
 
-    prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(candidate_count))
+    prompt_body = (
+        CANDIDATE_SELECTION_PROMPT
+        .replace("[CANDIDATE_COUNT]", str(candidate_count))
+        .replace("[MIN_BIRTH_YEAR]", str(PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR))
+        .replace("[MAX_BIRTH_YEAR]", str(PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR))
+        .replace("[MIN_AGE]", str(PLAUSIBLE_CANDIDATE_MIN_AGE))
+        .replace("[MAX_AGE]", str(PLAUSIBLE_CANDIDATE_MAX_AGE))
+    )
     return (
         "CRITICAL FORBIDDEN LIST:\n"
         f"[{forbidden_tail}]\n\n"
@@ -1487,6 +1523,20 @@ def build_retry_note(error_message: str) -> str:
         return (
             "Your previous candidate list did not contain any allowed person. "
             "Return a much more diverse candidate list, avoid obvious or previously used names, and go deeper than the usual celebrity staples. "
+            + (
+                f"Do not reuse these rejected examples: {rejected_tail}. "
+                if rejected_tail and rejected_tail.lower() != "none"
+                else ""
+            )
+        )
+    if "Candidate negotiation returned no plausible-age people" in error_message:
+        rejected_tail = ""
+        if "Rejected candidates:" in error_message:
+            rejected_tail = error_message.split("Rejected candidates:", 1)[1].strip()
+        return (
+            "Your previous candidate list used people who are obviously outside the game's age window. "
+            f"Only return celebrities born between {PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR} and {PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR}. "
+            "Do not return historical figures, very recent children, or anyone clearly outside that range. "
             + (
                 f"Do not reuse these rejected examples: {rejected_tail}. "
                 if rejected_tail and rejected_tail.lower() != "none"
@@ -1600,6 +1650,10 @@ GUESS_BUTTON_RE = re.compile(
     r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])submitGuess\((?P<status_q>['\"])(?P<status>alive|dead)(?P=status_q)\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
     re.IGNORECASE | re.DOTALL,
 )
+NEXT_ROUND_CONTROL_RE = re.compile(
+    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
+    re.IGNORECASE | re.DOTALL,
+)
 DISABLED_ATTR_RE = re.compile(r"\s+\bdisabled\b(?:\s*=\s*(['\"]).*?\1)?", re.IGNORECASE | re.DOTALL)
 ARIA_DISABLED_ATTR_RE = re.compile(
     r"\s+\baria-disabled\s*=\s*(['\"])(?:true|1)\1",
@@ -1676,6 +1730,27 @@ def ensure_guess_buttons_clickable(fragment: str) -> str:
         return f"<{tag}{attrs}>{label or fallback_label}</{tag}>"
 
     return GUESS_BUTTON_RE.sub(repl, fragment)
+
+
+def ensure_next_round_button_clickable(fragment: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        tag = match.group("tag")
+        attrs = match.group("attrs")
+        label = match.group("label")
+        attrs = DISABLED_ATTR_RE.sub("", attrs)
+        attrs = ARIA_DISABLED_ATTR_RE.sub("", attrs)
+        attrs = remove_classes_from_attrs(
+            attrs,
+            GUESS_BUTTON_DISABLED_CLASS_EXACT,
+            GUESS_BUTTON_DISABLED_CLASS_PREFIXES,
+        )
+        attrs = add_classes_to_attrs(
+            attrs,
+            "pointer-events-auto cursor-pointer opacity-100 text-black relative z-50",
+        )
+        return f"<{tag}{attrs}>{label or 'Next Round'}</{tag}>"
+
+    return NEXT_ROUND_CONTROL_RE.sub(repl, fragment, count=1)
 
 
 def normalize_reveal_status_tense(fragment: str) -> str:
@@ -2381,6 +2456,98 @@ def infer_status_from_summary(summary: dict) -> str | None:
     return None
 
 
+def extract_biographical_years(text: str) -> tuple[int | None, int | None]:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return None, None
+
+    lifespan_match = re.search(
+        r"\((?:c\.\s*)?(?P<birth>\d{4})\s*[–-]\s*(?P<death>\d{4})\)",
+        normalized,
+    )
+    if lifespan_match:
+        return int(lifespan_match.group("birth")), int(lifespan_match.group("death"))
+
+    born_match = re.search(
+        r"\((?:born|b\.)[^)]*?(?P<birth>\d{4})\)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if born_match:
+        return int(born_match.group("birth")), None
+
+    born_text_match = re.search(
+        r"\bborn\b[^.]{0,80}?(?P<birth>\d{4})",
+        normalized,
+        re.IGNORECASE,
+    )
+    if born_text_match:
+        return int(born_text_match.group("birth")), None
+
+    return None, None
+
+
+def birth_year_is_plausible_for_game(birth_year: int) -> bool:
+    return PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR <= birth_year <= PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR
+
+
+def resolve_candidate_age_plausibility(person_name: str) -> bool | None:
+    cache_key = normalize_name_key(person_name)
+    with candidate_plausibility_lock:
+        if cache_key in candidate_plausibility_cache:
+            return candidate_plausibility_cache[cache_key]
+
+    plausible: bool | None = None
+    try:
+        ranked_pages = sorted(
+            search_wikipedia_pages(person_name),
+            key=lambda page: (
+                -score_wikipedia_page_result(page, person_name, ""),
+                -len(str(page.get("description", ""))),
+            ),
+        )
+        for page in ranked_pages:
+            title = str(page.get("title", "")).strip()
+            description = str(page.get("description", "")).strip()
+            if not title or title_looks_non_biographical(title):
+                continue
+            if page_looks_non_person(title, description):
+                continue
+            matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
+            if not matches_person and not normalize_identity_text(title).startswith(
+                normalize_identity_text(person_name)
+            ):
+                continue
+
+            birth_year, _ = extract_biographical_years(description or title)
+            if birth_year is None:
+                page_key = str(page.get("key", "")).strip()
+                if page_key:
+                    try:
+                        summary = get_wikipedia_page_summary(page_key)
+                    except Exception:
+                        summary = {}
+                    summary_title = str(summary.get("title", "")).strip()
+                    summary_description = str(
+                        summary.get("description")
+                        or summary.get("extract")
+                        or ""
+                    ).strip()
+                    if page_looks_non_person(summary_title or title, summary_description):
+                        continue
+                    birth_year, _ = extract_biographical_years(summary_description)
+
+            if birth_year is not None:
+                plausible = birth_year_is_plausible_for_game(birth_year)
+                break
+    except Exception as exc:
+        logger.warning("Candidate plausibility check failed for %s: %s", person_name, exc)
+
+    with candidate_plausibility_lock:
+        candidate_plausibility_cache[cache_key] = plausible
+    return plausible
+
+
 def resolve_person_actual_status(person_name: str) -> str | None:
     cache_key = normalize_name_key(person_name)
     with status_resolution_lock:
@@ -2832,6 +2999,7 @@ def normalize_round(
         raise ValueError(f"Reveal UI is missing next-round button for {person_name}")
     guessing_ui_html = ensure_guess_buttons_clickable(guessing_ui_html)
     reveal_ui_html = normalize_reveal_status_tense(reveal_ui_html)
+    reveal_ui_html = ensure_next_round_button_clickable(reveal_ui_html)
     validate_fragment_output_rules(guessing_ui_html, person_name, "Guessing")
     validate_fragment_output_rules(reveal_ui_html, person_name, "Reveal")
     validate_status_neutral_guessing_copy(guessing_ui_html, person_name)
@@ -3216,11 +3384,12 @@ def choose_allowed_candidates(
     selection: CandidateSelection,
     forbidden: list[str],
     limit: int,
-) -> tuple[list[LockedCandidate], list[str]]:
+) -> tuple[list[LockedCandidate], list[str], list[str]]:
     forbidden_keys = {normalize_name_key(name) for name in forbidden}
     seen_keys: set[str] = set()
     accepted: list[LockedCandidate] = []
     rejected_names: list[str] = []
+    implausible_names: list[str] = []
 
     for candidate in selection.candidates:
         if len(accepted) >= limit:
@@ -3232,6 +3401,11 @@ def choose_allowed_candidates(
         if key in seen_keys or key in forbidden_keys:
             rejected_names.append(person_name)
             continue
+        plausible = resolve_candidate_age_plausibility(person_name)
+        if plausible is False:
+            rejected_names.append(person_name)
+            implausible_names.append(person_name)
+            continue
         seen_keys.add(key)
         accepted.append(
             LockedCandidate(
@@ -3241,7 +3415,7 @@ def choose_allowed_candidates(
             )
         )
 
-    return accepted, rejected_names
+    return accepted, rejected_names, implausible_names
 
 
 def choose_reused_candidates_from_history(
@@ -3359,7 +3533,7 @@ def negotiate_round_candidates_sync(
                     selection = select_candidates_with_modern_sdk(model_name, prompt, audit_meta)
                 else:
                     selection = select_candidates_with_legacy_sdk(model_name, prompt, audit_meta)
-                candidates, rejected_names = choose_allowed_candidates(
+                candidates, rejected_names, implausible_names = choose_allowed_candidates(
                     selection,
                     negotiation_forbidden,
                     remaining,
@@ -3370,6 +3544,11 @@ def negotiate_round_candidates_sync(
                 )
                 if not candidates:
                     rejected_tail = ", ".join(rejected_names[:12]) if rejected_names else "none"
+                    if implausible_names:
+                        raise ValueError(
+                            "Candidate negotiation returned no plausible-age people. "
+                            f"Rejected candidates: {rejected_tail}"
+                        )
                     raise ValueError(
                         "Candidate negotiation returned no newly allowed people. "
                         f"Rejected candidates: {rejected_tail}"
