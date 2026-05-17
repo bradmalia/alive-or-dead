@@ -2190,10 +2190,6 @@ def validate_portrait_placeholder_usage(
         raise ValueError(
             f"{label} UI contains too many portrait images for {person_name}"
         )
-    if placeholder_occurrences != len(image_sources):
-        raise ValueError(
-            f"{label} UI must use the portrait placeholder only inside <img src> attributes for {person_name}"
-        )
 
     for image_source in image_sources:
         if image_source != PORTRAIT_IMAGE_PLACEHOLDER:
@@ -2202,6 +2198,10 @@ def validate_portrait_placeholder_usage(
             )
 
     return image_sources
+
+
+def strip_stray_portrait_placeholder(fragment: str) -> str:
+    return fragment.replace(PORTRAIT_IMAGE_PLACEHOLDER, "")
 
 
 def build_portrait_search_candidates(
@@ -2857,6 +2857,8 @@ def normalize_round(
     )
     guessing_ui_html = inject_portrait_url(guessing_ui_html, portrait_url)
     reveal_ui_html = inject_portrait_url(reveal_ui_html, portrait_url)
+    guessing_ui_html = strip_stray_portrait_placeholder(guessing_ui_html)
+    reveal_ui_html = strip_stray_portrait_placeholder(reveal_ui_html)
     reveal_ui_html = humanize_reveal_dates(
         reveal_ui_html,
         round_item.date_of_birth,
