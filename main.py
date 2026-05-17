@@ -385,6 +385,37 @@ NON_PHOTO_TITLE_KEYWORDS = {
     "tape",
     "wax",
 }
+NON_PERSON_PAGE_KEYWORDS = {
+    "aircraft",
+    "airplane",
+    "cargo",
+    "boat",
+    "bus",
+    "car",
+    "cruise",
+    "destroyer",
+    "ferry",
+    "helicopter",
+    "liner",
+    "locomotive",
+    "ocean",
+    "plane",
+    "ship",
+    "sail",
+    "submarine",
+    "tank",
+    "tanker",
+    "tram",
+    "train",
+    "vehicle",
+    "vessel",
+    "warship",
+    "yacht",
+    "rms",
+    "hms",
+    "uss",
+    "ss",
+}
 NAME_TOKEN_STOPWORDS = {
     "mr",
     "mrs",
@@ -1713,6 +1744,20 @@ def title_looks_non_biographical(title: str) -> bool:
     )
 
 
+def page_looks_non_person(title: str, description: str = "") -> bool:
+    title_tokens = set(tokenize_identity_text(title))
+    description_tokens = set(tokenize_identity_text(description))
+    tokens = title_tokens | description_tokens
+    if tokens & NON_PERSON_PAGE_KEYWORDS:
+        return True
+    if "ocean liner" in description.casefold() or "cruise ship" in description.casefold():
+        return True
+    return bool(
+        {"ship", "liner", "vessel", "ferry", "boat", "yacht", "submarine", "aircraft", "plane", "train", "vehicle"}
+        & tokens
+    )
+
+
 def validate_portrait_search_query(person_name: str, portrait_search_query: str) -> str:
     query = sanitize_portrait_search_query(portrait_search_query)
     if not query:
@@ -1741,6 +1786,8 @@ def score_wikipedia_page_result(page: dict, person_name: str, portrait_context: 
     context_family = infer_context_family(portrait_context)
 
     score = 0
+    if page_looks_non_person(title, description):
+        score -= 120
     if title_looks_non_biographical(title):
         score -= 100
     if matches_person:
@@ -2316,7 +2363,10 @@ def resolve_wikipedia_page_portrait_url(
 
     for page in ranked_pages:
         title = str(page.get("title", ""))
+        description = str(page.get("description", ""))
         if title_looks_non_biographical(title):
+            continue
+        if page_looks_non_person(title, description):
             continue
         matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
         if not matches_person and not normalize_identity_text(title).startswith(
@@ -2329,6 +2379,14 @@ def resolve_wikipedia_page_portrait_url(
         try:
             summary = get_wikipedia_page_summary(page_key)
         except Exception:
+            continue
+        summary_title = str(summary.get("title", ""))
+        summary_description = str(
+            summary.get("description")
+            or summary.get("extract")
+            or ""
+        )
+        if page_looks_non_person(summary_title or title, summary_description):
             continue
         thumbnail = summary.get("thumbnail") or {}
         image_source = strip_url_query_and_fragment(str(thumbnail.get("source", "")).strip())
