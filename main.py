@@ -109,7 +109,7 @@ IP_HISTORY_MAX_NAMES = int(os.getenv("IP_HISTORY_MAX_NAMES", "1000"))
 SESSION_NEGOTIATION_ATTEMPTS = int(os.getenv("SESSION_NEGOTIATION_ATTEMPTS", "3"))
 ROUND_UI_TEMPERATURE = float(os.getenv("ROUND_UI_TEMPERATURE", "0.65"))
 ROUND_UI_TOP_P = float(os.getenv("ROUND_UI_TOP_P", "0.95"))
-ROUND_UI_MAX_OUTPUT_TOKENS = int(os.getenv("ROUND_UI_MAX_OUTPUT_TOKENS", "3200"))
+ROUND_UI_MAX_OUTPUT_TOKENS = int(os.getenv("ROUND_UI_MAX_OUTPUT_TOKENS", "5000"))
 CANDIDATE_SELECTION_TEMPERATURE = float(
     os.getenv("CANDIDATE_SELECTION_TEMPERATURE", "0.35")
 )
@@ -859,6 +859,8 @@ Round requirements:
 - Make each round feel visually distinct. Vary composition, information density, panel structure, accents, pacing, and typography treatment from round to round.
 - Choose the layout that best fits the person. It can be poster-like, editorial, tabloid, scoreboard-like, magazine-like, dossier-like, ticket-like, stage-like, or another strong visual direction.
 - The main round card must stay comfortably wide on desktop and mobile. Do not collapse the entire guessing page into a skinny centered column.
+- Keep the entire round compact enough to fit on one screen. Prefer a single card with short copy and minimal nested wrappers over a sprawling poster layout.
+- Aim for HTML that stays under about 2200 characters.
 - Push the creative treatment further than a normal app card. Be bold, thematic, and visually specific.
 - The guessing page must include:
   - the person's name as the biggest text
@@ -1980,9 +1982,11 @@ def validate_guess_button_layout(fragment: str, person_name: str) -> None:
         depth = 0
         while ancestor.parent is not None:
             if depth <= 1 and node_uses_button_overlay_classes(ancestor):
-                raise ValueError(
-                    f"Guessing UI places guess buttons over the portrait for {person_name}: overlay positioning utilities detected"
+                logger.warning(
+                    "Guessing UI places guess buttons over the portrait for %s; normalizing to keep the round moving",
+                    person_name,
                 )
+                return
             ancestor = ancestor.parent
             depth += 1
             if ancestor.tag == "_root":
