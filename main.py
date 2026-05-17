@@ -851,6 +851,7 @@ Round requirements:
 - Theme the UI around what the person is most famous for, but do not default to the same composition or design language every time.
 - Make each round feel visually distinct. Vary composition, information density, panel structure, accents, pacing, and typography treatment from round to round.
 - Choose the layout that best fits the person. It can be poster-like, editorial, tabloid, scoreboard-like, magazine-like, dossier-like, ticket-like, stage-like, or another strong visual direction.
+- The main round card must stay comfortably wide on desktop and mobile. Do not collapse the entire guessing page into a skinny centered column.
 - Push the creative treatment further than a normal app card. Be bold, thematic, and visually specific.
 - The guessing page must include:
   - the person's name as the biggest text
@@ -1537,6 +1538,13 @@ def normalize_generated_html_fragment(fragment: str) -> str:
     normalized = str(fragment or "")
     normalized = normalized.replace("\\r", "\n").replace("\\n", "\n").replace("\\t", " ")
     return normalized.strip()
+
+
+def wrap_round_fragment(fragment: str) -> str:
+    normalized = normalize_generated_html_fragment(fragment)
+    if not normalized:
+        return normalized
+    return f"<div class='round-fragment w-full'>{normalized}</div>"
 
 
 def format_display_date(iso_date: str) -> str:
@@ -2755,6 +2763,8 @@ def normalize_round(
         next_round_label,
         hide_on_mobile=True,
     )
+    guessing_ui_html = wrap_round_fragment(guessing_ui_html)
+    reveal_ui_html = wrap_round_fragment(reveal_ui_html)
     validate_embedded_image_urls(guessing_ui_html, person_name, "Guessing", require_image=True)
     validate_embedded_image_urls(reveal_ui_html, person_name, "Reveal")
 
@@ -3953,6 +3963,16 @@ async def index():
                     linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
                 background-size: 28px 28px;
                 mask-image: linear-gradient(180deg, rgba(0,0,0,0.9), rgba(0,0,0,0.2));
+            }}
+            .round-fragment {{
+                width: 100%;
+            }}
+            .round-fragment > * {{
+                width: 100% !important;
+                max-width: 100% !important;
+                box-sizing: border-box;
+                margin-left: auto;
+                margin-right: auto;
             }}
         </style>
     </head>
