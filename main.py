@@ -1521,6 +1521,19 @@ def humanize_reveal_dates(fragment: str, date_of_birth: str, date_of_death: str 
     return rewritten
 
 
+def build_mobile_next_round_bar() -> str:
+    return (
+        "<div class='fixed inset-x-0 bottom-0 z-50 flex justify-center px-4 pb-4 pt-3 md:hidden' "
+        "style='padding-bottom: calc(1rem + env(safe-area-inset-bottom));'>"
+        "<div class='pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black via-black/80 to-transparent'></div>"
+        "<button onclick=\"loadNextRound()\" "
+        "class='pointer-events-auto relative rounded-full border border-white/10 bg-white px-6 py-4 text-sm font-black uppercase tracking-[0.2em] text-black shadow-2xl shadow-black/40 transition hover:scale-105 active:scale-95'>"
+        "Next Round"
+        "</button>"
+        "</div>"
+    )
+
+
 def strip_url_query_and_fragment(url: str) -> str:
     parts = urlsplit(url)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
@@ -4146,7 +4159,7 @@ async def guess(request: FastAPIRequest):
         "</div>"
         "</div>"
     )
-    return {"reveal_ui_html": injection + round_data["reveal_ui_html"]}
+    return {"reveal_ui_html": injection + round_data["reveal_ui_html"] + build_mobile_next_round_bar()}
 
 
 if __name__ == "__main__":
