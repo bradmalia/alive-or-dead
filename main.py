@@ -49,6 +49,11 @@ if legacy_genai and api_key:
 
 BASE_DIR = Path(__file__).resolve().parent
 IP_HISTORY_FILE = BASE_DIR / "ip_history.json"
+CANDIDATE_IP_POOL_FILE = Path(
+    os.getenv("CANDIDATE_IP_POOL_FILE", str(BASE_DIR / "ip_candidate_pools.json"))
+).expanduser()
+if not CANDIDATE_IP_POOL_FILE.is_absolute():
+    CANDIDATE_IP_POOL_FILE = (BASE_DIR / CANDIDATE_IP_POOL_FILE).resolve()
 CANDIDATE_BANK_FILE = Path(
     os.getenv("CANDIDATE_BANK_FILE", str(BASE_DIR / "candidate_bank.json"))
 ).expanduser()
@@ -89,6 +94,12 @@ SESSION_APPROVED_POOL_SIZE = int(
 )
 SESSION_CANDIDATE_TARGET_COUNT = int(
     os.getenv("SESSION_CANDIDATE_TARGET_COUNT", "30")
+)
+IP_CANDIDATE_POOL_MAX_ENTRIES = int(
+    os.getenv("IP_CANDIDATE_POOL_MAX_ENTRIES", str(SESSION_CANDIDATE_TARGET_COUNT))
+)
+IP_CANDIDATE_POOL_TTL_SECONDS = int(
+    os.getenv("IP_CANDIDATE_POOL_TTL_SECONDS", str(7 * 24 * 60 * 60))
 )
 CANDIDATE_BANK_MAX_ENTRIES = int(os.getenv("CANDIDATE_BANK_MAX_ENTRIES", "400"))
 CANDIDATE_BANK_TTL_SECONDS = int(
@@ -515,7 +526,10 @@ class GeneratedRound(BaseModel):
     @classmethod
     def normalize_actual_status(cls, value):
         if isinstance(value, str):
-            return value.strip().lower()
+            normalized = value.strip().lower()
+            if normalized == "deceased":
+                return "dead"
+            return normalized
         return value
 
     @field_validator("date_of_birth")
@@ -566,7 +580,10 @@ class CandidatePerson(BaseModel):
     @classmethod
     def normalize_actual_status(cls, value):
         if isinstance(value, str):
-            return value.strip().lower()
+            normalized = value.strip().lower()
+            if normalized == "deceased":
+                return "dead"
+            return normalized
         return value
 
 
@@ -635,6 +652,7 @@ portrait_resolution_lock = threading.Lock()
 status_resolution_cache: dict[str, str | None] = {}
 status_resolution_lock = threading.Lock()
 ip_history_lock = threading.Lock()
+candidate_ip_pool_lock = threading.Lock()
 candidate_bank_lock = threading.Lock()
 wikimedia_request_lock = threading.Lock()
 last_wikimedia_request_at = 0.0
@@ -801,7 +819,7 @@ Round requirements:
   - exactly one portrait `<img>` whose `src` is the exact literal `__PORTRAIT_IMAGE_URL__`
   - `submitGuess('alive')` and `submitGuess('dead')` buttons
 - The reveal page must match the same theme and include `loadNextRound()`.
-- The reveal page should include a compact factual date reference using the returned date fields, especially for the verdict moment.
+- The reveal page should include a compact factual date reference using the returned date fields, especially for the verdict moment, and should display those dates in a human-readable format like `April 5th, 2006` rather than raw ISO strings.
 
 Output rules:
 - Tailwind classes only. No <script>, <style>, <html>, <body>, <head>, markdown fences, SVG data URIs, or base64.
@@ -815,7 +833,8 @@ Output rules:
 - The reveal page may omit the portrait, but if it includes one, it must reuse the exact same `__PORTRAIT_IMAGE_URL__` placeholder.
 - Do not place `__PORTRAIT_IMAGE_URL__` anywhere except an `<img src>` attribute.
 - The single portrait image may be used boldly, but on the guessing page it should still read as a recognizable portrait rather than disappearing into pure texture.
-- Atmospheric treatments are allowed. Blur, fade, or soft-focus effects are acceptable if the person still feels generally identifiable and the page remains visually legible.
+- Keep the actual portrait photo sharp and readable. Do not blur, heavily soften, smear, or defocus the `<img>` itself.
+- Atmospheric treatments are allowed around the portrait with normal background layers, glows, gradients, or decorative shapes, but the actual portrait photo must remain crisp.
 - Avoid turning the only guessing-page portrait into a totally abstract background wash unless the rest of the composition is especially strong and readable.
 - Never repeat `__PORTRAIT_IMAGE_URL__` in CSS `url(...)`, inline styles, text, data attributes, masks, pseudo-background tricks, or additional `<img>` tags.
 - Treat the portrait as one physical photo element. Build frames, glows, overlays, shadows, spotlights, and scenery around it with normal `<div>` layers, not by duplicating the portrait placeholder.
@@ -825,6 +844,9 @@ Output rules:
 - Avoid crops or overlay treatments that make the portrait feel cut off at the eyes or washed out through the middle of the face.
 - The full `person_name` must remain fully visible and readable. Never clip, crop, truncate, or push part of the name off-canvas.
 - If the name is long, reduce the type size or wrap it cleanly instead of letting the text overflow outside its container.
+- The name block must fit fully inside its panel with comfortable side padding. Do not let oversized display text run into the panel edge or off the right side of the card.
+- For long names in split or poster layouts, prefer smaller headline sizes, more line breaks, or a wider text column instead of extreme oversized typography.
+- Avoid giant serif or ultra-wide headline treatments for long names unless you are certain the full name still fits inside the visible card bounds on both desktop and mobile.
 - Put the `submitGuess('alive')` and `submitGuess('dead')` buttons in a dedicated controls block outside the portrait area.
 - The guess buttons must never overlap the portrait, float over the portrait, or appear inside the portrait panel.
 - Do not use absolute or fixed positioning, inset utilities, negative margins, or translate utilities to place the guess buttons over the image.
@@ -867,6 +889,7 @@ Candidate rules:
 - Each candidate must include:
   - `person_name`
   - `actual_status`
+- `actual_status` must be exactly `alive` or `dead`. Never use `deceased`, `passed away`, `late`, or any other synonym.
 - Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable.
 - Never return anyone from the forbidden list in the user prompt.
 - Use canonical common public names only.
@@ -1012,18 +1035,21 @@ def update_ip_history(client_ip_key: str, names: list[str]) -> list[str]:
         history = trim_fifo_names(history, IP_HISTORY_MAX_NAMES)
         histories[ip_key] = history
         write_ip_histories_unlocked(histories)
-        return list(history)
+    for name in names:
+        if name:
+            forget_candidate_from_ip_pool(ip_key, name)
+    return list(history)
 
 
 def candidate_bank_entry_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def prune_candidate_bank_entries(entries: list[dict]) -> list[dict]:
+def prune_candidate_like_entries(entries: list[dict], ttl_seconds: int, max_entries: int) -> list[dict]:
     if not entries:
         return []
 
-    cutoff_ts = time.time() - max(CANDIDATE_BANK_TTL_SECONDS, 0)
+    cutoff_ts = time.time() - max(ttl_seconds, 0)
     deduped: list[dict] = []
     seen: set[str] = set()
 
@@ -1058,9 +1084,134 @@ def prune_candidate_bank_entries(entries: list[dict]) -> list[dict]:
         )
 
     deduped.reverse()
-    if len(deduped) > CANDIDATE_BANK_MAX_ENTRIES:
-        deduped = deduped[-CANDIDATE_BANK_MAX_ENTRIES:]
+    if len(deduped) > max_entries:
+        deduped = deduped[-max_entries:]
     return deduped
+
+
+def read_ip_candidate_pools_unlocked() -> dict[str, list[dict]]:
+    try:
+        if CANDIDATE_IP_POOL_FILE.exists():
+            content = CANDIDATE_IP_POOL_FILE.read_text(encoding="utf-8").strip()
+            if content:
+                payload = json.loads(content)
+                if isinstance(payload, dict):
+                    normalized: dict[str, list[dict]] = {}
+                    for raw_ip_key, raw_entries in payload.items():
+                        if not isinstance(raw_entries, list):
+                            continue
+                        ip_key = normalize_client_ip(str(raw_ip_key))
+                        normalized_entries = prune_candidate_like_entries(
+                            raw_entries,
+                            IP_CANDIDATE_POOL_TTL_SECONDS,
+                            IP_CANDIDATE_POOL_MAX_ENTRIES,
+                        )
+                        if normalized_entries:
+                            normalized[ip_key] = normalized_entries
+                    return normalized
+    except Exception as exc:
+        logger.error("Failed to read IP candidate pools: %s", exc)
+    return {}
+
+
+def write_ip_candidate_pools_unlocked(pools: dict[str, list[dict]]) -> None:
+    normalized: dict[str, list[dict]] = {}
+    for raw_ip_key, raw_entries in pools.items():
+        if not isinstance(raw_entries, list):
+            continue
+        ip_key = normalize_client_ip(str(raw_ip_key))
+        normalized_entries = prune_candidate_like_entries(
+            raw_entries,
+            IP_CANDIDATE_POOL_TTL_SECONDS,
+            IP_CANDIDATE_POOL_MAX_ENTRIES,
+        )
+        if normalized_entries:
+            normalized[ip_key] = normalized_entries
+    CANDIDATE_IP_POOL_FILE.write_text(
+        json.dumps(normalized, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+
+def select_candidates_from_ip_pool(client_ip_key: str, forbidden: list[str], limit: int) -> list[LockedCandidate]:
+    if limit <= 0:
+        return []
+    ip_key = normalize_client_ip(client_ip_key)
+    forbidden_keys = {normalize_name_key(name) for name in forbidden}
+    selected: list[LockedCandidate] = []
+    selected_keys: set[str] = set()
+    with candidate_ip_pool_lock:
+        pools = read_ip_candidate_pools_unlocked()
+        entries = list(pools.get(ip_key, []))
+
+    for entry in reversed(entries):
+        person_name = str(entry.get("person_name", ""))
+        actual_status = str(entry.get("actual_status", "")).strip().lower() or None
+        key = normalize_name_key(person_name)
+        if not person_name or key in forbidden_keys or key in selected_keys:
+            continue
+        selected_keys.add(key)
+        selected.append(
+            LockedCandidate(
+                person_name=person_name,
+                actual_status=actual_status,
+                source="ip_candidate_pool",
+            )
+        )
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+
+def remember_candidates_for_ip_pool(client_ip_key: str, candidates: list[LockedCandidate]) -> None:
+    if not candidates:
+        return
+    ip_key = normalize_client_ip(client_ip_key)
+    new_entries = [
+        {
+            "person_name": " ".join(candidate.person_name.split()),
+            "actual_status": (candidate.actual_status or "").strip().lower(),
+            "updated_at": candidate_bank_entry_timestamp(),
+        }
+        for candidate in candidates
+        if candidate.person_name and (candidate.actual_status or "").strip().lower() in {"alive", "dead"}
+    ]
+    if not new_entries:
+        return
+    with candidate_ip_pool_lock:
+        pools = read_ip_candidate_pools_unlocked()
+        entries = list(pools.get(ip_key, []))
+        entries.extend(new_entries)
+        pools[ip_key] = entries
+        write_ip_candidate_pools_unlocked(pools)
+
+
+def forget_candidate_from_ip_pool(client_ip_key: str, person_name: str) -> None:
+    ip_key = normalize_client_ip(client_ip_key)
+    person_key = normalize_name_key(person_name)
+    with candidate_ip_pool_lock:
+        pools = read_ip_candidate_pools_unlocked()
+        entries = pools.get(ip_key, [])
+        filtered = [
+            entry
+            for entry in entries
+            if normalize_name_key(str(entry.get("person_name", ""))) != person_key
+        ]
+        if filtered:
+            pools[ip_key] = filtered
+        elif ip_key in pools:
+            pools.pop(ip_key, None)
+        if len(filtered) != len(entries):
+            write_ip_candidate_pools_unlocked(pools)
+
+
+def prune_candidate_bank_entries(entries: list[dict]) -> list[dict]:
+    return prune_candidate_like_entries(
+        entries,
+        CANDIDATE_BANK_TTL_SECONDS,
+        CANDIDATE_BANK_MAX_ENTRIES,
+    )
 
 
 def read_candidate_bank_unlocked() -> list[dict]:
@@ -1178,6 +1329,12 @@ def collect_ip_reserved_names(client_ip_key: str, exclude_session_id: str | None
     for session_id, session in sessions.items():
         if exclude_session_id and session_id == exclude_session_id:
             continue
+        try:
+            round_number = int(session.get("round_number", 0))
+        except (TypeError, ValueError):
+            continue
+        if round_number >= ROUNDS_PER_GAME:
+            continue
         if normalize_client_ip(session.get("client_ip_key")) != normalized_ip:
             continue
         reserved_names.extend(session.get("reserved_names", []))
@@ -1246,6 +1403,12 @@ def build_candidate_selection_prompt(
 
 
 def build_retry_note(error_message: str) -> str:
+    lowered = error_message.lower()
+    if "actual_status" in lowered and "deceased" in lowered:
+        return (
+            "Your previous attempt used the invalid status word 'deceased'. "
+            "Use exactly `alive` or `dead` for `actual_status`; never use synonyms."
+        )
     if error_message.startswith("Model returned forbidden person:"):
         person_name = error_message.split(": ", 1)[1]
         return (
@@ -1332,6 +1495,30 @@ def normalize_generated_html_fragment(fragment: str) -> str:
     normalized = str(fragment or "")
     normalized = normalized.replace("\\r", "\n").replace("\\n", "\n").replace("\\t", " ")
     return normalized.strip()
+
+
+def format_display_date(iso_date: str) -> str:
+    parsed = datetime.strptime(iso_date, "%Y-%m-%d")
+    day = parsed.day
+    suffix = "th"
+    if day % 100 not in {11, 12, 13}:
+        if day % 10 == 1:
+            suffix = "st"
+        elif day % 10 == 2:
+            suffix = "nd"
+        elif day % 10 == 3:
+            suffix = "rd"
+    return f"{parsed.strftime('%B')} {day}{suffix}, {parsed.year}"
+
+
+def humanize_reveal_dates(fragment: str, date_of_birth: str, date_of_death: str | None) -> str:
+    rewritten = fragment
+    replacements = [date_of_birth]
+    if date_of_death:
+        replacements.append(date_of_death)
+    for iso_date in replacements:
+        rewritten = rewritten.replace(iso_date, format_display_date(iso_date))
+    return rewritten
 
 
 def strip_url_query_and_fragment(url: str) -> str:
@@ -2434,6 +2621,11 @@ def normalize_round(
     )
     guessing_ui_html = inject_portrait_url(guessing_ui_html, portrait_url)
     reveal_ui_html = inject_portrait_url(reveal_ui_html, portrait_url)
+    reveal_ui_html = humanize_reveal_dates(
+        reveal_ui_html,
+        round_item.date_of_birth,
+        round_item.date_of_death,
+    )
     validate_embedded_image_urls(guessing_ui_html, person_name, "Guessing", require_image=True)
     validate_embedded_image_urls(reveal_ui_html, person_name, "Reveal")
 
@@ -2838,10 +3030,18 @@ def negotiate_round_candidates_sync(
     pool_size: int,
     audit_meta: dict[str, object],
 ) -> tuple[str, list[LockedCandidate]]:
+    client_ip_key = normalize_client_ip(str(audit_meta.get("client_ip_key", "unknown")))
     working_forbidden = list(dict.fromkeys(forbidden))
     retry_notes: list[str] = []
     errors: list[str] = []
-    approved: list[LockedCandidate] = select_candidates_from_bank(working_forbidden, pool_size)
+    approved: list[LockedCandidate] = []
+    use_ip_pool = client_ip_key != "unknown"
+    if use_ip_pool:
+        approved = select_candidates_from_ip_pool(
+            client_ip_key,
+            working_forbidden,
+            pool_size,
+        )
     last_successful_model: str | None = None
 
     if approved:
@@ -2854,6 +3054,33 @@ def negotiate_round_candidates_sync(
             status="accepted",
             accepted_count=len(approved),
             person_names=[candidate.person_name for candidate in approved],
+            source="ip_candidate_pool",
+            **audit_meta,
+        )
+        if len(approved) >= pool_size:
+            return "ip_candidate_pool", approved
+
+    bank_candidates = select_candidates_from_bank(
+        merge_names_recency_preserving(
+            working_forbidden,
+            [candidate.person_name for candidate in approved],
+        ),
+        pool_size - len(approved),
+    )
+    if bank_candidates:
+        approved.extend(bank_candidates)
+        if use_ip_pool:
+            remember_candidates_for_ip_pool(client_ip_key, bank_candidates)
+        working_forbidden = merge_names_recency_preserving(
+            working_forbidden,
+            [candidate.person_name for candidate in bank_candidates],
+        )
+        append_gemini_audit_log(
+            "candidate_bank.reuse",
+            status="accepted",
+            accepted_count=len(bank_candidates),
+            person_names=[candidate.person_name for candidate in bank_candidates],
+            source="candidate_bank",
             **audit_meta,
         )
         if len(approved) >= pool_size:
@@ -2909,6 +3136,8 @@ def negotiate_round_candidates_sync(
                 accepted_this_attempt += len(candidates)
                 last_successful_model = model_name
                 remember_candidates_in_bank(candidates)
+                if use_ip_pool:
+                    remember_candidates_for_ip_pool(client_ip_key, candidates)
                 append_gemini_audit_log(
                     "gemini.candidate_selection_result",
                     model=model_name,
@@ -3249,6 +3478,7 @@ def exclude_round_candidate(
         session.get("excluded_candidates", []),
         [locked_candidate.person_name],
     )
+    forget_candidate_from_ip_pool(session.get("client_ip_key", "unknown"), locked_candidate.person_name)
     forget_candidate_from_bank(locked_candidate.person_name)
     append_gemini_audit_log(
         "round.candidate_excluded",
@@ -3768,6 +3998,9 @@ async def status():
         "ip_history_max_names": IP_HISTORY_MAX_NAMES,
         "session_candidate_count": SESSION_APPROVED_POOL_SIZE,
         "session_candidate_target_count": SESSION_CANDIDATE_TARGET_COUNT,
+        "candidate_ip_pool_file": str(CANDIDATE_IP_POOL_FILE),
+        "candidate_ip_pool_max_entries": IP_CANDIDATE_POOL_MAX_ENTRIES,
+        "candidate_ip_pool_ttl_seconds": IP_CANDIDATE_POOL_TTL_SECONDS,
         "candidate_bank_file": str(CANDIDATE_BANK_FILE),
         "candidate_bank_max_entries": CANDIDATE_BANK_MAX_ENTRIES,
         "candidate_bank_ttl_seconds": CANDIDATE_BANK_TTL_SECONDS,

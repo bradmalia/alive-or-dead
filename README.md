@@ -66,6 +66,17 @@ The workflow:
 - Set `GEMINI_AUDIT_LOG_ENABLED=false` to disable it.
 - Set `GEMINI_AUDIT_LOG_FILE=/custom/path/gemini_audit.jsonl` to change the log location.
 
+## Local Runtime State
+
+The app writes a few mutable JSON files beside `main.py` while it runs:
+
+- `ip_history.json`
+- `candidate_bank.json`
+- `ip_candidate_pools.json`
+- `portrait_resolution_cache.json`
+
+These are local runtime artifacts. They are excluded from deploy syncs and may change while you play or when the backend refreshes its cached candidate and portrait data.
+
 ## Status Validation Toggle
 
 - `STATUS_VALIDATION_ENABLED=false` by default.
