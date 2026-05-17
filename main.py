@@ -906,10 +906,15 @@ Output rules:
 - The reveal page should feel like a deliberate continuation or escalation of the guessing page concept, not just the same shell with new text.
 - Keep each HTML fragment concise, but you may use richer structure and more layered presentation. Target under 3000 characters.
 - Keep button text high contrast.
+- Guess buttons must be visibly enabled, clickable, and high contrast. Never use disabled attributes, `pointer-events-none`, `cursor-not-allowed`, low-opacity classes, or disabled-state styling on the Alive/Dead buttons.
 - Do not include literal backslash escape sequences like `\\n`, `\\r`, or `\\t` in the final HTML fragments.
 - Design for a single-screen experience. The full guessing page and reveal page should fit comfortably in a normal desktop browser viewport without requiring vertical scrolling.
 - Prefer compact spacing, restrained portrait sizing, and tighter composition when needed so the entire round is visible at once.
 - Do not build tall poster layouts that push the buttons or key copy below the fold.
+
+Reveal wording:
+- Use present tense for the final status. Say `is alive` or `is dead`, not `was alive` or `was dead`.
+- Do not describe the status itself in past tense, even when the person is dead.
 
 Spoiler rules for the guessing page:
 - Never mention death, assassination, murder, funeral, memorial, burial, "late", "still alive", or any status-revealing phrasing.
@@ -1582,6 +1587,24 @@ NEXT_ROUND_BUTTON_RE = re.compile(
     r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
     re.IGNORECASE | re.DOTALL,
 )
+GUESS_BUTTON_RE = re.compile(
+    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])submitGuess\((?P<status_q>['\"])(?P<status>alive|dead)(?P=status_q)\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
+    re.IGNORECASE | re.DOTALL,
+)
+DISABLED_ATTR_RE = re.compile(r"\s+\bdisabled\b(?:\s*=\s*(['\"]).*?\1)?", re.IGNORECASE | re.DOTALL)
+ARIA_DISABLED_ATTR_RE = re.compile(
+    r"\s+\baria-disabled\s*=\s*(['\"])(?:true|1)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+GUESS_BUTTON_DISABLED_CLASS_EXACT = {
+    "cursor-not-allowed",
+    "pointer-events-none",
+}
+GUESS_BUTTON_DISABLED_CLASS_PREFIXES = (
+    "opacity-",
+    "disabled:",
+    "aria-disabled:",
+)
 
 
 def sanitize_next_round_label(label: str | None) -> str:
@@ -1603,6 +1626,62 @@ def add_classes_to_attrs(attrs: str, extra_classes: str) -> str:
         replacement = f'class={quote}{combined_classes}{quote}'
         return attrs[: class_match.start()] + replacement + attrs[class_match.end() :]
     return f"{attrs} class=\"{extra_classes.strip()}\""
+
+
+def remove_classes_from_attrs(
+    attrs: str,
+    exact_classes: set[str],
+    class_prefixes: tuple[str, ...] = (),
+) -> str:
+    class_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.IGNORECASE | re.DOTALL)
+    if not class_match:
+        return attrs
+    quote = class_match.group(1)
+    kept_classes = [
+        token
+        for token in class_match.group(2).split()
+        if token not in exact_classes and not token.startswith(class_prefixes)
+    ]
+    replacement = f"class={quote}{' '.join(kept_classes)}{quote}"
+    return attrs[: class_match.start()] + replacement + attrs[class_match.end() :]
+
+
+def ensure_guess_buttons_clickable(fragment: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        tag = match.group("tag")
+        attrs = match.group("attrs")
+        label = match.group("label")
+        status = match.group("status").lower()
+        attrs = DISABLED_ATTR_RE.sub("", attrs)
+        attrs = ARIA_DISABLED_ATTR_RE.sub("", attrs)
+        attrs = remove_classes_from_attrs(
+            attrs,
+            GUESS_BUTTON_DISABLED_CLASS_EXACT,
+            GUESS_BUTTON_DISABLED_CLASS_PREFIXES,
+        )
+        attrs = add_classes_to_attrs(
+            attrs,
+            "pointer-events-auto cursor-pointer opacity-100 text-white",
+        )
+        fallback_label = "Alive" if status == "alive" else "Dead"
+        return f"<{tag}{attrs}>{label or fallback_label}</{tag}>"
+
+    return GUESS_BUTTON_RE.sub(repl, fragment)
+
+
+def normalize_reveal_status_tense(fragment: str) -> str:
+    rewrites = {
+        "was alive": "is alive",
+        "was dead": "is dead",
+        "Was Alive": "Is Alive",
+        "Was Dead": "Is Dead",
+        "WAS ALIVE": "IS ALIVE",
+        "WAS DEAD": "IS DEAD",
+    }
+    normalized = fragment
+    for original, replacement in rewrites.items():
+        normalized = normalized.replace(original, replacement)
+    return normalized
 
 
 def rewrite_next_round_control(fragment: str, label: str, hide_on_mobile: bool = False) -> str:
@@ -2737,6 +2816,8 @@ def normalize_round(
         raise ValueError(f"Guessing UI is missing guess buttons for {person_name}")
     if not NEXT_ROUND_RE.search(reveal_ui_html):
         raise ValueError(f"Reveal UI is missing next-round button for {person_name}")
+    guessing_ui_html = ensure_guess_buttons_clickable(guessing_ui_html)
+    reveal_ui_html = normalize_reveal_status_tense(reveal_ui_html)
     validate_fragment_output_rules(guessing_ui_html, person_name, "Guessing")
     validate_fragment_output_rules(reveal_ui_html, person_name, "Reveal")
     validate_status_neutral_guessing_copy(guessing_ui_html, person_name)
@@ -4008,6 +4089,14 @@ async def index():
                 box-sizing: border-box;
                 margin-left: auto;
                 margin-right: auto;
+            }}
+            .round-fragment button[onclick*="submitGuess"],
+            .round-fragment a[onclick*="submitGuess"] {{
+                pointer-events: auto !important;
+                cursor: pointer !important;
+                opacity: 1 !important;
+                position: relative;
+                z-index: 40;
             }}
         </style>
     </head>
