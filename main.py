@@ -718,6 +718,7 @@ Output rules:
 - CRITICAL DESIGN RULE: You MUST create incredibly striking, highly stylized, and visually dramatic UI themes.
 - DO NOT use simple centered white cards or generic layouts.
 - You MUST use inline <svg> tags to draw large, abstract thematic background elements (like diagonal slashes, geometric patterns, or thematic icons) using absolute positioning behind the content.
+- NEVER use `data:image` or base64 data URIs inside your SVGs or anywhere else.
 - You MUST use standard Tailwind animations (e.g. animate-pulse, animate-bounce, animate-spin) or arbitrary animation values to make the page dynamic and alive.
 - Use massive typography, complex asymmetrical grid/flex layouts, intense gradients, deep drop-shadows, and glassmorphism (backdrop-blur).
 - Keep each HTML fragment under 4000 characters. Be ambitious with the DOM complexity.
@@ -1280,6 +1281,7 @@ def build_portrait_search_candidates(person_name: str, portrait_search_query: st
         f"{person_name} portrait",
         f"{person_name} headshot",
         f"{person_name} publicity portrait",
+        person_name,
     ]
     deduped: list[str] = []
     seen: set[str] = set()
