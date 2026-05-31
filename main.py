@@ -701,7 +701,7 @@ Output rules:
 - You MAY use raw <svg> tags directly in the HTML for icons, abstract background shapes, and thematic decorations. Do not use SVG data URIs.
 - Do not output any final remote image URL anywhere in the JSON. The backend will resolve the portrait URL from `portrait_search_query`.
 - `portrait_search_query` must be plain text, not a URL, and should be a concise Wikimedia Commons portrait search phrase.
-- Use a query structure like `[person name] [era or year if helpful] portrait`, `[person name] headshot`, or `[person name] publicity photo`.
+- To avoid giving away their current age/status, `portrait_search_query` MUST include the name of the role, movie, or era they are most famous for (e.g. `Kevin Bacon Footloose portrait` or `Sean Connery 1960s James Bond`).
 - Prefer portrait, headshot, publicity photo, or press photo wording when useful.
 - Do not include site names like `wikipedia`, `wikimedia`, or `commons` in `portrait_search_query`; the backend already searches Wikimedia Commons.
 - If you are not confident you can suggest a clean portrait query, choose a different person instead of guessing.
@@ -1603,29 +1603,7 @@ def resolve_wikimedia_portrait_url(person_name: str, portrait_search_query: str)
     )
 
     try:
-        wikipedia_page_result = resolve_wikipedia_page_portrait_url(person_name)
-        if wikipedia_page_result is not None:
-            image_source, resolved_title = wikipedia_page_result
-            validate_image_url_reachable(image_source, person_name, "Resolved portrait")
-            portrait_resolution_cache.set(cache_key, (True, image_source))
-            append_gemini_audit_log(
-                "portrait.resolve",
-                status="accepted",
-                person_name=person_name,
-                portrait_search_query=search_query,
-                attempted_queries=["wikipedia_page_exact_or_search"],
-                resolved_portrait_url=image_source,
-                resolved_from_query="wikipedia_page_exact_or_search",
-                resolved_title=resolved_title,
-            )
-            log_perf(
-                "portrait.resolve",
-                started_at,
-                person_name=person_name,
-                portrait_search_query=search_query,
-                resolved_from_query="wikipedia_page_exact_or_search",
-            )
-            return image_source
+
 
         for candidate_query in build_portrait_search_candidates(person_name, search_query):
             attempted_queries.append(candidate_query)
@@ -1689,6 +1667,30 @@ def resolve_wikimedia_portrait_url(person_name: str, portrait_search_query: str)
                     resolved_from_query=candidate_query,
                 )
                 return image_source
+
+        wikipedia_page_result = resolve_wikipedia_page_portrait_url(person_name)
+        if wikipedia_page_result is not None:
+            image_source, resolved_title = wikipedia_page_result
+            validate_image_url_reachable(image_source, person_name, "Resolved portrait")
+            portrait_resolution_cache.set(cache_key, (True, image_source))
+            append_gemini_audit_log(
+                "portrait.resolve",
+                status="accepted",
+                person_name=person_name,
+                portrait_search_query=search_query,
+                attempted_queries=["wikipedia_page_exact_or_search"] + attempted_queries,
+                resolved_portrait_url=image_source,
+                resolved_from_query="wikipedia_page_exact_or_search",
+                resolved_title=resolved_title,
+            )
+            log_perf(
+                "portrait.resolve",
+                started_at,
+                person_name=person_name,
+                portrait_search_query=search_query,
+                resolved_from_query="wikipedia_page_exact_or_search",
+            )
+            return image_source
     except Exception as exc:
         resolution_error = (
             f"{resolution_error} ({exc})"
