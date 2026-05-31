@@ -697,7 +697,8 @@ Round requirements:
 - The person cannot be one of these formerly selected people: [NAMELIST]
 
 Output rules:
-- Tailwind classes only. No <script>, <style>, <html>, <body>, <head>, markdown fences, SVG data URIs, or base64.
+- Tailwind classes only. No <script>, <style>, <html>, <body>, <head>, markdown fences, or base64.
+- You MAY use raw <svg> tags directly in the HTML for icons, abstract background shapes, and thematic decorations. Do not use SVG data URIs.
 - Do not output any final remote image URL anywhere in the JSON. The backend will resolve the portrait URL from `portrait_search_query`.
 - `portrait_search_query` must be plain text, not a URL, and should be a concise Wikimedia Commons portrait search phrase.
 - Use a query structure like `[person name] [era or year if helpful] portrait`, `[person name] headshot`, or `[person name] publicity photo`.
@@ -714,8 +715,8 @@ Output rules:
 - If you need a square or shaped portrait area, use core Tailwind utilities like `aspect-square`, explicit `h-*`, `w-*`, `min-h-*`, and normal layout sizing instead.
 - Do not use any remote URL or CSS `url(...)` inside backgrounds, overlays, masks, or decorative styles.
 - Do not include extra `<img>` tags for logos, title cards, decorative textures, or background art.
-- If you want atmosphere, use gradients, borders, overlays, badges, shapes, labels, and typography.
-- Keep each HTML fragment concise. Target under 1400 characters.
+- If you want atmosphere, use gradients, borders, overlays, badges, shapes, labels, and typography. You can use standard Tailwind animations (animate-pulse, animate-bounce, etc.) or arbitrary animation utilities.
+- Keep each HTML fragment under 3000 characters. Feel free to use complex grids, layers, glassmorphism, and bold structural designs.
 - Prefer a bold split layout or layered poster layout, not a generic centered card.
 - Keep button text high contrast.
 
