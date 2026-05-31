@@ -104,7 +104,7 @@ LOCAL_CANDIDATE_FIRST_HISTORY_SIZE = int(
 )
 GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.35"))
 GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.8"))
-GENERATION_MAX_OUTPUT_TOKENS = int(os.getenv("GENERATION_MAX_OUTPUT_TOKENS", "2400"))
+GENERATION_MAX_OUTPUT_TOKENS = int(os.getenv("GENERATION_MAX_OUTPUT_TOKENS", "4000"))
 CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS = int(
     os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "2000")
 )
@@ -701,7 +701,7 @@ Output rules:
 - You MAY use raw <svg> tags directly in the HTML for icons, abstract background shapes, and thematic decorations. Do not use SVG data URIs.
 - Do not output any final remote image URL anywhere in the JSON. The backend will resolve the portrait URL from `portrait_search_query`.
 - `portrait_search_query` must be plain text, not a URL, and should be a concise Wikimedia Commons portrait search phrase.
-- To avoid giving away their current age/status, `portrait_search_query` MUST include the name of the role, movie, or era they are most famous for (e.g. `Kevin Bacon Footloose portrait` or `Sean Connery 1960s James Bond`).
+- To avoid giving away their current age/status, `portrait_search_query` MUST append the specific year or decade of their peak fame (e.g., `Kevin Bacon 1984` or `Sean Connery 1960s`). Do NOT use movie titles, as Wikimedia Commons lacks copyrighted movie stills.
 - Prefer portrait, headshot, publicity photo, or press photo wording when useful.
 - Do not include site names like `wikipedia`, `wikimedia`, or `commons` in `portrait_search_query`; the backend already searches Wikimedia Commons.
 - If you are not confident you can suggest a clean portrait query, choose a different person instead of guessing.
@@ -720,6 +720,7 @@ Output rules:
 - You MUST use inline <svg> tags to draw large, abstract thematic background elements (like diagonal slashes, geometric patterns, or thematic icons) using absolute positioning behind the content.
 - NEVER use `data:image` or base64 data URIs inside your SVGs or anywhere else.
 - You MUST use standard Tailwind animations (e.g. animate-pulse, animate-bounce, animate-spin) or arbitrary animation values to make the page dynamic and alive.
+- DO NOT use `<style>` tags, custom CSS blocks, or `@keyframes`. All styling and animation must be done via inline Tailwind classes.
 - Use massive typography, complex asymmetrical grid/flex layouts, intense gradients, deep drop-shadows, and glassmorphism (backdrop-blur).
 - Keep each HTML fragment under 4000 characters. Be ambitious with the DOM complexity.
 - Keep button text high contrast.
@@ -760,6 +761,8 @@ Critical forbidden-list compliance:
 
 
 def extract_json(text: str) -> dict | list | None:
+    # Clean up common markdown escapes that break JSON string parsing (e.g. \*)
+    text = re.sub(r'\\([*_\~\[\]#|])', r'\1', text)
     # Fast path: model returned clean JSON with no surrounding prose.
     try:
         return json.loads(text)
