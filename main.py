@@ -715,9 +715,12 @@ Output rules:
 - If you need a square or shaped portrait area, use core Tailwind utilities like `aspect-square`, explicit `h-*`, `w-*`, `min-h-*`, and normal layout sizing instead.
 - Do not use any remote URL or CSS `url(...)` inside backgrounds, overlays, masks, or decorative styles.
 - Do not include extra `<img>` tags for logos, title cards, decorative textures, or background art.
-- If you want atmosphere, use gradients, borders, overlays, badges, shapes, labels, and typography. You can use standard Tailwind animations (animate-pulse, animate-bounce, etc.) or arbitrary animation utilities.
-- Keep each HTML fragment under 3000 characters. Feel free to use complex grids, layers, glassmorphism, and bold structural designs.
-- Prefer a bold split layout or layered poster layout, not a generic centered card.
+- CRITICAL DESIGN RULE: You MUST create incredibly striking, highly stylized, and visually dramatic UI themes.
+- DO NOT use simple centered white cards or generic layouts.
+- You MUST use inline <svg> tags to draw large, abstract thematic background elements (like diagonal slashes, geometric patterns, or thematic icons) using absolute positioning behind the content.
+- You MUST use standard Tailwind animations (e.g. animate-pulse, animate-bounce, animate-spin) or arbitrary animation values to make the page dynamic and alive.
+- Use massive typography, complex asymmetrical grid/flex layouts, intense gradients, deep drop-shadows, and glassmorphism (backdrop-blur).
+- Keep each HTML fragment under 4000 characters. Be ambitious with the DOM complexity.
 - Keep button text high contrast.
 
 Spoiler rules for the guessing page:
