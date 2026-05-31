@@ -12,6 +12,7 @@ concurrency:
 
 env:
   DEPLOY_PATH: /home/ubuntu/alive-or-dead
+  PUBLIC_BASE_URL: https://www.maliaplace.com
 
 jobs:
   deploy:
@@ -56,3 +57,23 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_ed25519 "$DEPLOY_USER@$DEPLOY_HOST" \
             "APP_DIR=$DEPLOY_PATH bash $DEPLOY_PATH/deploy/remote_deploy.sh"
+
+      - name: Health check root page
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 5 --retry-connrefused \
+            "$PUBLIC_BASE_URL/" | grep -q "Projects by Brad Malia"
+
+      - name: Health check game status API
+        run: |
+          status_json="$(curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 5 --retry-connrefused \
+            "$PUBLIC_BASE_URL/alive-or-dead/api/status")"
+          STATUS_JSON="$status_json" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["STATUS_JSON"])
+          assert data["image_contract"] == "backend_wikimedia_query_resolution"
+          assert data["gemini_audit_log_enabled"] is True
+          PY

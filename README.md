@@ -1,6 +1,6 @@
 # Alive or Dead POC
 
-This is a Proof of Concept for the "Alive or Dead" game, featuring an AI-driven game loop and dynamic UI generation. Gemini returns the round JSON and HTML fragments directly, plus a portrait search query that the backend resolves into a verified Wikimedia image URL.
+This is a Proof of Concept for the "Alive or Dead" game, featuring an AI-driven game loop and dynamic UI generation. Gemini returns the round JSON and HTML fragments directly, while the backend verifies current vital status through Wikidata and resolves a portrait search query into a verified Wikimedia image URL.
 
 ## Project Structure
 
@@ -62,51 +62,23 @@ The workflow:
 ## Gemini Audit Log
 
 - Gemini prompt/response audit events are written to `gemini_audit.jsonl` in the project root by default.
-- Each JSONL entry records the exact prompt text, model, SDK, raw `response_text`, portrait-resolution events, persisted `perf` timing events, and whether the round was accepted or rejected.
+- Each JSONL entry records the exact prompt text, model, SDK, raw `response_text`, portrait-resolution events, and whether the round was accepted or rejected.
 - Set `GEMINI_AUDIT_LOG_ENABLED=false` to disable it.
 - Set `GEMINI_AUDIT_LOG_FILE=/custom/path/gemini_audit.jsonl` to change the log location.
-
-## Local Runtime State
-
-The app writes a few mutable JSON files beside `main.py` while it runs:
-
-- `ip_history.json`
-- `candidate_bank.json`
-- `ip_candidate_pools.json`
-- `portrait_resolution_cache.json`
-
-These are local runtime artifacts. They are excluded from deploy syncs and may change while you play or when the backend refreshes its cached candidate and portrait data.
-
-## Status Validation Toggle
-
-- `STATUS_VALIDATION_ENABLED=false` by default.
-- Set `STATUS_VALIDATION_ENABLED=true` to enable a best-effort Wikipedia/Wikidata status verification pass before round generation.
-- When disabled, Python skips the Wikipedia/Wikidata verification pass and relies on the generated round payload for `actual_status`, `date_of_birth`, and `date_of_death`.
-
-## Portrait Fallback Behavior
-
-- `PORTRAIT_FALLBACK_MODE=prefer_real` by default.
-- Supported modes:
-  - `fast`: do not retry Wikimedia `429` responses; immediately use the local avatar fallback
-  - `prefer_real`: retry Wikimedia briefly, then use the local avatar fallback if throttling continues
-  - `require_real`: retry Wikimedia briefly and fail the round if a real portrait still cannot be resolved
-- `WIKIMEDIA_429_RETRY_COUNT=2` controls how many retry attempts are made after the first throttled request in `prefer_real` and `require_real` modes.
-- `WIKIMEDIA_429_RETRY_BACKOFF_MS=350` controls the base backoff delay between retries.
-- Successful remote portrait URLs are cached on disk in `portrait_resolution_cache.json`; local avatar fallbacks are not persisted, so later runs can retry for a real image.
 
 ## Game Loop
 
 1. **Start**: The user clicks "START POC".
-2. **Negotiation**: Gemini first proposes a larger candidate bench for the caller's IP address, and Python filters that list against the per-IP FIFO history before reserving a 10-round plan.
-3. **Guessing State**: For each round, Gemini renders themed Tailwind UI for one locked celebrity, returns `actual_status`, `date_of_birth`, `date_of_death`, and a `portrait_search_query`, and the backend resolves a live Wikimedia portrait for the user to guess [ALIVE] or [DEAD].
-4. **Dramatic Reveal**: Upon selection, the UI transforms into a themed reveal (celebratory for alive, respectful for dead).
-5. **Session Tracking**: The backend tracks the score over 10 rounds.
-6. **Finale**: After 10 rounds, a final score screen is displayed.
+2. **Guessing State**: Gemini selects a subject (e.g., Keanu Reeves), returns themed Tailwind UI plus a `portrait_search_query`, and the backend resolves a live Wikimedia portrait for the user to guess [ALIVE] or [DEAD].
+   - With larger global histories, the backend can preselect an unused local candidate and verify status before asking Gemini to build the UI, avoiding repeated rejected candidate-selection calls.
+3. **Dramatic Reveal**: Upon selection, the UI transforms into a themed reveal (celebratory for alive, respectful for dead).
+4. **Session Tracking**: The backend tracks the score over 10 rounds.
+5. **Finale**: After 10 rounds, a final score screen is displayed.
 
 ## AI System Prompt
 
 The core logic for the AI subject selection and UI generation is defined in the `SYSTEM_PROMPT` variable within `main.py`. It instructs the AI to:
-- Render a round for an already locked celebrity rather than freely picking a new one.
-- Return `actual_status`, `date_of_birth`, and `date_of_death` consistently.
-- Generate a clean, themed UI without revealing the answer on the guessing page.
+- Autonomously pick a famous person.
+- Include their current status, which the backend verifies against Wikidata before the round is accepted.
+- Generate a clean, themed UI without revealing the answer.
 - Return a portrait search query while keeping the HTML on a fixed portrait placeholder that the backend replaces with a verified Wikimedia image URL.

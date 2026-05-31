@@ -1,5 +1,22 @@
+"""
+Alive or Dead — FastAPI backend.
+
+Structure:
+  1. Imports & logging
+  2. Environment / configuration constants
+  3. Pydantic models & dataclasses
+  4. HTML parser for fragment validation
+  5. Module-level state (sessions, caches, AI client)
+  6. Utility functions (perf logging, audit log, JSON extraction, …)
+  7. Wikimedia helpers (portrait search, status verification)
+  8. AI generation pipeline (prompt building, SDK wrappers, round normalisation)
+  9. Session orchestration (prefetch, round queue)
+ 10. FastAPI app, middleware, and HTTP route handlers
+"""
 import asyncio
+import collections
 import concurrent.futures
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import html
@@ -16,14 +33,13 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request as UrlRequest, urlopen
-from urllib.error import HTTPError
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from pydantic import field_validator, model_validator
+from pydantic import field_validator
 
 try:
     from google import genai as modern_genai
@@ -48,25 +64,7 @@ if legacy_genai and api_key:
     legacy_genai.configure(api_key=api_key)
 
 BASE_DIR = Path(__file__).resolve().parent
-IP_HISTORY_FILE = BASE_DIR / "ip_history.json"
-CANDIDATE_IP_POOL_FILE = Path(
-    os.getenv("CANDIDATE_IP_POOL_FILE", str(BASE_DIR / "ip_candidate_pools.json"))
-).expanduser()
-if not CANDIDATE_IP_POOL_FILE.is_absolute():
-    CANDIDATE_IP_POOL_FILE = (BASE_DIR / CANDIDATE_IP_POOL_FILE).resolve()
-CANDIDATE_BANK_FILE = Path(
-    os.getenv("CANDIDATE_BANK_FILE", str(BASE_DIR / "candidate_bank.json"))
-).expanduser()
-if not CANDIDATE_BANK_FILE.is_absolute():
-    CANDIDATE_BANK_FILE = (BASE_DIR / CANDIDATE_BANK_FILE).resolve()
-PORTRAIT_RESOLUTION_CACHE_FILE = Path(
-    os.getenv(
-        "PORTRAIT_RESOLUTION_CACHE_FILE",
-        str(BASE_DIR / "portrait_resolution_cache.json"),
-    )
-).expanduser()
-if not PORTRAIT_RESOLUTION_CACHE_FILE.is_absolute():
-    PORTRAIT_RESOLUTION_CACHE_FILE = (BASE_DIR / PORTRAIT_RESOLUTION_CACHE_FILE).resolve()
+GLOBAL_HISTORY_FILE = BASE_DIR / "global_history.json"
 
 
 def normalize_app_base_path(raw_value: str | None) -> str:
@@ -82,86 +80,57 @@ def app_path(path: str) -> str:
     normalized_path = path if path.startswith("/") else f"/{path}"
     return f"{APP_BASE_PATH}{normalized_path}" if APP_BASE_PATH else normalized_path
 
-APP_VERSION = "3.6.2"
+APP_VERSION = "3.6.0"
 APP_BASE_PATH = normalize_app_base_path(os.getenv("APP_BASE_PATH", ""))
-CURRENT_YEAR = datetime.now(timezone.utc).year
+# CORS: set CORS_ALLOWED_ORIGINS to a comma-separated list of origins to restrict
+# cross-origin access (e.g. "https://example.com,https://www.example.com").
+# Leave unset to allow all origins (no credentials forwarded either way).
+_CORS_ALLOWED_ORIGINS_RAW = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+CORS_ALLOWED_ORIGINS: list[str] = (
+    [o.strip() for o in _CORS_ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
+    if _CORS_ALLOWED_ORIGINS_RAW
+    else ["*"]
+)
 ROUNDS_PER_GAME = 10
+GLOBAL_HISTORY_PROMPT_LIMIT = int(os.getenv("GLOBAL_HISTORY_PROMPT_LIMIT", "500"))
 ROUND_GENERATION_ATTEMPTS = int(os.getenv("ROUND_GENERATION_ATTEMPTS", "3"))
 PREFETCH_ROUND_BUFFER = int(os.getenv("PREFETCH_ROUND_BUFFER", "2"))
-CANDIDATE_SELECTION_COUNT = int(os.getenv("CANDIDATE_SELECTION_COUNT", "60"))
-CANDIDATE_SELECTION_MIN_COUNT = int(os.getenv("CANDIDATE_SELECTION_MIN_COUNT", "24"))
-SESSION_APPROVED_POOL_SIZE = int(
-    os.getenv("SESSION_APPROVED_POOL_SIZE", str(ROUNDS_PER_GAME))
+CANDIDATE_SELECTION_COUNT = min(
+    50,
+    max(1, int(os.getenv("CANDIDATE_SELECTION_COUNT", "30"))),
 )
-SESSION_CANDIDATE_TARGET_COUNT = int(
-    os.getenv("SESSION_CANDIDATE_TARGET_COUNT", "30")
+LOCAL_CANDIDATE_FIRST_HISTORY_SIZE = int(
+    os.getenv("LOCAL_CANDIDATE_FIRST_HISTORY_SIZE", "250")
 )
-IP_CANDIDATE_POOL_MAX_ENTRIES = int(
-    os.getenv("IP_CANDIDATE_POOL_MAX_ENTRIES", str(SESSION_CANDIDATE_TARGET_COUNT))
-)
-IP_CANDIDATE_POOL_TTL_SECONDS = int(
-    os.getenv("IP_CANDIDATE_POOL_TTL_SECONDS", str(7 * 24 * 60 * 60))
-)
-CANDIDATE_BANK_MAX_ENTRIES = int(os.getenv("CANDIDATE_BANK_MAX_ENTRIES", "400"))
-CANDIDATE_BANK_TTL_SECONDS = int(
-    os.getenv("CANDIDATE_BANK_TTL_SECONDS", str(7 * 24 * 60 * 60))
-)
-IP_HISTORY_MAX_NAMES = int(os.getenv("IP_HISTORY_MAX_NAMES", "1000"))
-SESSION_NEGOTIATION_ATTEMPTS = int(os.getenv("SESSION_NEGOTIATION_ATTEMPTS", "3"))
-ROUND_UI_TEMPERATURE = float(os.getenv("ROUND_UI_TEMPERATURE", "0.65"))
-ROUND_UI_TOP_P = float(os.getenv("ROUND_UI_TOP_P", "0.95"))
-ROUND_UI_MAX_OUTPUT_TOKENS = int(os.getenv("ROUND_UI_MAX_OUTPUT_TOKENS", "5000"))
-CANDIDATE_SELECTION_TEMPERATURE = float(
-    os.getenv("CANDIDATE_SELECTION_TEMPERATURE", "0.35")
-)
-CANDIDATE_SELECTION_TOP_P = float(
-    os.getenv("CANDIDATE_SELECTION_TOP_P", "0.8")
-)
+GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.35"))
+GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.8"))
+GENERATION_MAX_OUTPUT_TOKENS = int(os.getenv("GENERATION_MAX_OUTPUT_TOKENS", "2400"))
 CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS = int(
-    os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "4500")
+    os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "2000")
 )
-PLAUSIBLE_CANDIDATE_MIN_AGE = int(
-    os.getenv("PLAUSIBLE_CANDIDATE_MIN_AGE", "8")
-)
-PLAUSIBLE_CANDIDATE_MAX_AGE = int(
-    os.getenv("PLAUSIBLE_CANDIDATE_MAX_AGE", "120")
-)
-PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR = CURRENT_YEAR - PLAUSIBLE_CANDIDATE_MAX_AGE
-PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR = CURRENT_YEAR - PLAUSIBLE_CANDIDATE_MIN_AGE
-RACE_FAST_MODELS = os.getenv("RACE_FAST_MODELS", "true").lower() == "true"
+RACE_FAST_MODELS = os.getenv("RACE_FAST_MODELS", "false").lower() == "true"
+# Session lifetime: sessions older than this are automatically evicted.
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 90)))       # default 90 min
+SESSION_CLEANUP_INTERVAL_SECONDS = int(os.getenv("SESSION_CLEANUP_INTERVAL_SECONDS", "300"))  # default 5 min
 PERF_LOG_ENABLED = os.getenv("PERF_LOG_ENABLED", "true").lower() == "true"
 GEMINI_AUDIT_LOG_ENABLED = os.getenv("GEMINI_AUDIT_LOG_ENABLED", "true").lower() == "true"
 IMAGE_URL_VALIDATION_ENABLED = os.getenv("IMAGE_URL_VALIDATION_ENABLED", "true").lower() == "true"
-STATUS_VALIDATION_ENABLED = os.getenv("STATUS_VALIDATION_ENABLED", "false").lower() == "true"
-PORTRAIT_FALLBACK_MODE = os.getenv("PORTRAIT_FALLBACK_MODE", "prefer_real").strip().lower()
+STATUS_VERIFICATION_ENABLED = os.getenv("STATUS_VERIFICATION_ENABLED", "true").lower() == "true"
+STATUS_VERIFICATION_REQUIRED = os.getenv("STATUS_VERIFICATION_REQUIRED", "true").lower() == "true"
 IMAGE_URL_VALIDATION_TIMEOUT_SECONDS = float(
     os.getenv("IMAGE_URL_VALIDATION_TIMEOUT_SECONDS", "4.0")
-)
-WIKIMEDIA_429_RETRY_COUNT = int(os.getenv("WIKIMEDIA_429_RETRY_COUNT", "2"))
-WIKIMEDIA_429_RETRY_BACKOFF_MS = float(
-    os.getenv("WIKIMEDIA_429_RETRY_BACKOFF_MS", "350")
-)
-WIKIMEDIA_MIN_REQUEST_INTERVAL_MS = float(
-    os.getenv("WIKIMEDIA_MIN_REQUEST_INTERVAL_MS", "200")
-)
-PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES = int(
-    os.getenv("PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES", "2000")
 )
 WIKIMEDIA_SEARCH_TIMEOUT_SECONDS = float(
     os.getenv("WIKIMEDIA_SEARCH_TIMEOUT_SECONDS", "3.0")
 )
 WIKIMEDIA_SEARCH_LIMIT = int(os.getenv("WIKIMEDIA_SEARCH_LIMIT", "8"))
-APP_CONTACT_URL = os.getenv(
-    "APP_CONTACT_URL",
-    "https://www.maliaplace.com/alive-or-dead",
-)
 IMAGE_FETCH_USER_AGENT = os.getenv(
     "IMAGE_FETCH_USER_AGENT",
-    f"AliveOrDeadPOC/{APP_VERSION} ({APP_CONTACT_URL}; image validation)",
+    f"AliveOrDeadPOC/{APP_VERSION} (image validation)",
 )
 WIKIMEDIA_API_USER_AGENT = os.getenv(
     "WIKIMEDIA_API_USER_AGENT",
-    f"AliveOrDeadPOC/{APP_VERSION} ({APP_CONTACT_URL}; wikimedia search)",
+    f"AliveOrDeadPOC/{APP_VERSION} (wikimedia search)",
 )
 FAST_MODEL_CANDIDATES = [
     item.strip()
@@ -184,9 +153,9 @@ GEMINI_AUDIT_LOG_FILE = Path(
 ).expanduser()
 if not GEMINI_AUDIT_LOG_FILE.is_absolute():
     GEMINI_AUDIT_LOG_FILE = (BASE_DIR / GEMINI_AUDIT_LOG_FILE).resolve()
-
-if PORTRAIT_FALLBACK_MODE not in {"fast", "prefer_real", "require_real"}:
-    PORTRAIT_FALLBACK_MODE = "prefer_real"
+# Audit log rotation: rotate when file exceeds this size; keep this many backups.
+GEMINI_AUDIT_LOG_MAX_BYTES = int(os.getenv("GEMINI_AUDIT_LOG_MAX_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+GEMINI_AUDIT_LOG_BACKUP_COUNT = int(os.getenv("GEMINI_AUDIT_LOG_BACKUP_COUNT", "3"))
 
 GUESS_ALIVE_RE = re.compile(r"submitGuess\((['\"])alive\1\)")
 GUESS_DEAD_RE = re.compile(r"submitGuess\((['\"])dead\1\)")
@@ -194,21 +163,17 @@ NEXT_ROUND_RE = re.compile(r"loadNextRound\(\)")
 IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*(['\"])(.*?)\1", re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
-TAILWIND_OPACITY_RE = re.compile(r"opacity-(\d{1,3})$")
-TAILWIND_SCALE_RE = re.compile(r"scale-(\d{2,3})$")
-INLINE_OPACITY_RE = re.compile(r"opacity\s*:\s*(0(?:\.\d+)?|1(?:\.0+)?)", re.IGNORECASE)
-INLINE_BLUR_RE = re.compile(r"blur\s*\(", re.IGNORECASE)
-INLINE_SCALE_RE = re.compile(r"scale\s*\(\s*([0-9.]+)", re.IGNORECASE)
 QUOTED_TEXT_RE = re.compile(r'"[^"]{1,160}"|\'[^\']{1,160}\'|“[^”]{1,160}”|‘[^’]{1,160}’')
-ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REMOTE_IMAGE_PREFIXES = ("http://", "https://", "//")
 WIKIMEDIA_DOMAIN_MARKERS = ("wikimedia.org", "wikipedia.org")
 PORTRAIT_IMAGE_PLACEHOLDER = "__PORTRAIT_IMAGE_URL__"
 WIKIMEDIA_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIPEDIA_PAGE_SEARCH_API_URL = "https://api.wikimedia.org/core/v1/wikipedia/en/search/page"
 WIKIPEDIA_PAGE_SUMMARY_API_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/"
-WIKIPEDIA_ACTION_API_URL = "https://en.wikipedia.org/w/api.php"
-WIKIDATA_ENTITY_DATA_URL = "https://www.wikidata.org/wiki/Special:EntityData/"
+WIKIDATA_ENTITY_DATA_URL_TEMPLATE = "https://www.wikidata.org/wiki/Special:EntityData/{entity_id}.json"
+WIKIDATA_INSTANCE_OF_PROPERTY = "P31"
+WIKIDATA_DATE_OF_DEATH_PROPERTY = "P570"
+WIKIDATA_HUMAN_ENTITY_ID = "Q5"
 WIKIMEDIA_THUMB_PREFIXES = (
     "https://upload.wikimedia.org/wikipedia/commons/thumb/",
     "http://upload.wikimedia.org/wikipedia/commons/thumb/",
@@ -220,8 +185,11 @@ VALID_WIKIMEDIA_THUMB_WIDTHS = {
     "60",
     "120",
     "250",
+    "320",
     "330",
     "500",
+    "640",
+    "800",
     "960",
     "1280",
     "1920",
@@ -229,127 +197,6 @@ VALID_WIKIMEDIA_THUMB_WIDTHS = {
 }
 SUPPORTED_RASTER_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 COMMONS_QUERY_NOISE_RE = re.compile(r"\b(?:wikimedia|wikipedia|commons)\b", re.IGNORECASE)
-GENERIC_PORTRAIT_QUERY_TOKENS = {
-    "portrait",
-    "headshot",
-    "publicity",
-    "press",
-    "photo",
-    "photos",
-    "publicityphoto",
-}
-CONTEXT_STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "from",
-    "that",
-    "this",
-    "their",
-    "they",
-    "them",
-    "his",
-    "her",
-    "its",
-    "into",
-    "across",
-    "known",
-    "most",
-    "famous",
-    "fact",
-    "once",
-    "like",
-    "both",
-    "beloved",
-    "iconic",
-    "legendary",
-    "career",
-    "continues",
-    "continued",
-}
-CONTEXT_FAMILY_KEYWORDS = {
-    "acting": {
-        "actor",
-        "actress",
-        "film",
-        "films",
-        "movie",
-        "movies",
-        "screen",
-        "television",
-        "tv",
-        "sitcom",
-        "series",
-        "comedy",
-        "comedian",
-        "role",
-        "roles",
-        "blockbuster",
-        "heroic",
-        "hero",
-        "star",
-    },
-    "music": {
-        "singer",
-        "song",
-        "songs",
-        "album",
-        "albums",
-        "music",
-        "musician",
-        "band",
-        "guitar",
-        "guitarist",
-        "rapper",
-        "composer",
-        "performer",
-    },
-    "sports": {
-        "athlete",
-        "sports",
-        "player",
-        "football",
-        "baseball",
-        "basketball",
-        "tennis",
-        "boxing",
-        "boxer",
-        "olympic",
-        "golfer",
-        "racer",
-    },
-    "politics": {
-        "president",
-        "politician",
-        "senator",
-        "governor",
-        "campaign",
-        "white",
-        "house",
-        "statesman",
-        "minister",
-        "prime",
-    },
-    "science": {
-        "scientist",
-        "physicist",
-        "astronaut",
-        "inventor",
-        "mathematician",
-        "researcher",
-        "professor",
-    },
-}
-PAGE_ROLE_MISMATCH_KEYWORDS = {
-    "acting": {"presenter", "broadcaster", "radio", "host", "dj"},
-}
-GUESSING_PORTRAIT_MIN_OPACITY = float(
-    os.getenv("GUESSING_PORTRAIT_MIN_OPACITY", "0.75")
-)
-GUESSING_PORTRAIT_MAX_SCALE = float(
-    os.getenv("GUESSING_PORTRAIT_MAX_SCALE", "1.1")
-)
 COMMONS_CANDIDATE_BONUSES = (
     ("portrait", 6),
     ("headshot", 5),
@@ -379,56 +226,20 @@ COMMONS_CANDIDATE_PENALTIES = (
     ("concert", -2),
 )
 NON_PHOTO_TITLE_KEYWORDS = {
-    "album",
     "artwork",
     "caricature",
     "cartoon",
-    "cover",
     "drawing",
     "illustration",
     "mural",
     "painting",
-    "logo",
     "poster",
     "sculpture",
     "sketch",
-    "svg",
     "statue",
     "tableau",
     "tape",
     "wax",
-    "wordmark",
-}
-NON_PERSON_PAGE_KEYWORDS = {
-    "aircraft",
-    "airplane",
-    "cargo",
-    "boat",
-    "bus",
-    "car",
-    "cruise",
-    "destroyer",
-    "ferry",
-    "helicopter",
-    "liner",
-    "locomotive",
-    "ocean",
-    "plane",
-    "ship",
-    "sail",
-    "submarine",
-    "tank",
-    "tanker",
-    "tram",
-    "train",
-    "vehicle",
-    "vessel",
-    "warship",
-    "yacht",
-    "rms",
-    "hms",
-    "uss",
-    "ss",
 }
 NAME_TOKEN_STOPWORDS = {
     "mr",
@@ -496,6 +307,99 @@ EMERGENCY_FALLBACK_NAMES = [
     "Paul Newman",
     "Aretha Franklin",
     "Marlon Brando",
+    "Julie Christie",
+    "Vanessa Redgrave",
+    "Faye Dunaway",
+    "Elliott Gould",
+    "Sally Field",
+    "Lily Tomlin",
+    "Bette Midler",
+    "Goldie Hawn",
+    "Kurt Russell",
+    "Michael Douglas",
+    "Kathleen Turner",
+    "Geena Davis",
+    "Candice Bergen",
+    "Glenn Close",
+    "Jessica Lange",
+    "Michelle Pfeiffer",
+    "Jamie Lee Curtis",
+    "Danny DeVito",
+    "Michael Keaton",
+    "Kevin Bacon",
+    "John Lithgow",
+    "Bryan Cranston",
+    "Diana Ross",
+    "Carole King",
+    "Dionne Warwick",
+    "Smokey Robinson",
+    "Gladys Knight",
+    "Patti LaBelle",
+    "Bonnie Raitt",
+    "James Taylor",
+    "Iggy Pop",
+    "Alice Cooper",
+    "Rod Stewart",
+    "Sting",
+    "Phil Collins",
+    "Peter Gabriel",
+    "Annie Lennox",
+    "Cyndi Lauper",
+    "Boy George",
+    "Billy Joel",
+    "Wayne Gretzky",
+    "Martina Navratilova",
+    "Billie Jean King",
+    "Nadia Comaneci",
+    "Carl Lewis",
+    "Mark Spitz",
+    "Jack Nicklaus",
+    "Gary Player",
+    "John McEnroe",
+    "Chris Evert",
+    "Jane Goodall",
+    "Margaret Atwood",
+    "Salman Rushdie",
+    "Isabel Allende",
+    "Andrew Lloyd Webber",
+    "Arthur Miller",
+    "Tennessee Williams",
+    "Marlene Dietrich",
+    "Bette Davis",
+    "Greta Garbo",
+    "Katharine Hepburn",
+    "Ava Gardner",
+    "Rita Hayworth",
+    "Peter O'Toole",
+    "Omar Sharif",
+    "Halle Berry",
+    "Sandra Oh",
+    "Lucy Liu",
+    "Ming-Na Wen",
+    "Michelle Yeoh",
+    "Chow Yun-fat",
+    "Jet Li",
+    "Gong Li",
+    "Pedro Almodovar",
+    "Werner Herzog",
+    "Ken Burns",
+    "Spike Lee",
+    "Ridley Scott",
+    "Martin Sheen",
+    "Allison Janney",
+    "Frances McDormand",
+    "Meryl Streep",
+    "Viola Davis",
+    "Laura Dern",
+    "Laura Linney",
+    "Diane Lane",
+    "Angela Bassett",
+    "Joni Mitchell",
+    "Jeff Bridges",
+    "Cary Grant",
+    "Ingrid Bergman",
+    "Janis Joplin",
+    "Amy Winehouse",
 ]
 BUTTON_OVERLAY_CLASS_PREFIXES = (
     "inset-",
@@ -527,8 +431,21 @@ PROHIBITED_FRAGMENT_PATTERNS = [
         r"<\s*head\b",
         r"data:image",
         r"base64",
+        # Block javascript: pseudo-protocol in href/src/action attributes.
+        r"""javascript\s*:""",
+        # NOTE: inline on* event-handler attribute validation is performed by
+        # validate_fragment_event_handlers(), which allowlists the two known-safe
+        # game callbacks (submitGuess / loadNextRound) while rejecting everything else.
     ]
 ]
+# Allowlisted onclick values for AI-generated fragments.  Any onclick whose
+# normalised value does not match one of these is rejected as unsafe.
+_SAFE_ONCLICK_RE = re.compile(
+    r"""^\s*(?:submitGuess\(\s*['"](?:alive|dead)['"]\s*\)|loadNextRound\(\s*\))\s*$""",
+    re.IGNORECASE,
+)
+# Any HTML attribute name that begins with "on" is an event handler.
+_EVENT_ATTR_RE = re.compile(r"^on\w+$", re.IGNORECASE)
 UNSUPPORTED_TAILWIND_CLASS_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
@@ -561,87 +478,27 @@ SPOILER_HINT_PATTERNS = [
 class GeneratedRound(BaseModel):
     person_name: str = Field(min_length=1, max_length=100)
     actual_status: Literal["alive", "dead"]
-    date_of_birth: str = Field(min_length=10, max_length=10)
-    date_of_death: str | None = Field(default=None, min_length=10, max_length=10)
     portrait_search_query: str = Field(min_length=3, max_length=200)
-    next_round_label: str = Field(default="Next Round", max_length=80)
     guessing_ui_html: str = Field(min_length=50, max_length=5000)
     reveal_ui_html: str = Field(min_length=50, max_length=5000)
-
-    @field_validator("actual_status", mode="before")
-    @classmethod
-    def normalize_actual_status(cls, value):
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized == "deceased":
-                return "dead"
-            return normalized
-        return value
-
-    @field_validator("date_of_birth")
-    @classmethod
-    def validate_date_of_birth(cls, value: str) -> str:
-        normalized = value.strip()
-        if not ISO_DATE_RE.fullmatch(normalized):
-            raise ValueError("date_of_birth must use YYYY-MM-DD format")
-        datetime.strptime(normalized, "%Y-%m-%d")
-        return normalized
-
-    @field_validator("date_of_death", mode="before")
-    @classmethod
-    def normalize_date_of_death(cls, value):
-        if value is None:
-            return None
-        if isinstance(value, str):
-            normalized = value.strip()
-            return normalized or None
-        return value
-
-    @field_validator("date_of_death")
-    @classmethod
-    def validate_date_of_death(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if not ISO_DATE_RE.fullmatch(value):
-            raise ValueError("date_of_death must use YYYY-MM-DD format")
-        datetime.strptime(value, "%Y-%m-%d")
-        return value
-
-    @field_validator("next_round_label", mode="before")
-    @classmethod
-    def normalize_next_round_label(cls, value):
-        if isinstance(value, str):
-            return " ".join(value.split())
-        return value
-
-    @model_validator(mode="after")
-    def validate_status_dates(self):
-        if self.actual_status == "alive" and self.date_of_death is not None:
-            raise ValueError("actual_status/date_of_death mismatch: alive people must not include date_of_death")
-        if self.actual_status == "dead" and self.date_of_death is None:
-            raise ValueError("actual_status/date_of_death mismatch: dead people must include date_of_death")
-        if self.date_of_death and self.date_of_birth > self.date_of_death:
-            raise ValueError("date_of_birth must not be later than date_of_death")
-        return self
 
 
 class CandidatePerson(BaseModel):
     person_name: str = Field(min_length=1, max_length=100)
-    actual_status: Literal["alive", "dead"]
+    actual_status: Literal["alive", "dead"] | None = None
 
     @field_validator("actual_status", mode="before")
     @classmethod
     def normalize_actual_status(cls, value):
+        if value is None:
+            return value
         if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized == "deceased":
-                return "dead"
-            return normalized
+            return value.strip().lower()
         return value
 
 
 class CandidateSelection(BaseModel):
-    candidates: list[CandidatePerson] = Field(min_length=1, max_length=200)
+    candidates: list[CandidatePerson] = Field(min_length=1, max_length=50)
 
 
 @dataclass(frozen=True)
@@ -649,10 +506,6 @@ class LockedCandidate:
     person_name: str
     actual_status: str | None = None
     source: str = "candidate_selection"
-
-
-class CandidatePortraitUnavailableError(RuntimeError):
-    pass
 
 
 @dataclass
@@ -698,19 +551,50 @@ runtime_state = {
 }
 modern_client = modern_genai.Client(api_key=api_key) if modern_genai and api_key else None
 gemini_audit_log_lock = threading.Lock()
-image_url_validation_cache: dict[str, tuple[bool, str]] = {}
-image_url_validation_lock = threading.Lock()
-portrait_resolution_cache: dict[tuple[str, str], tuple[bool, str]] = {}
-portrait_resolution_lock = threading.Lock()
-status_resolution_cache: dict[str, str | None] = {}
-status_resolution_lock = threading.Lock()
-candidate_plausibility_cache: dict[str, bool | None] = {}
-candidate_plausibility_lock = threading.Lock()
-ip_history_lock = threading.Lock()
-candidate_ip_pool_lock = threading.Lock()
-candidate_bank_lock = threading.Lock()
-wikimedia_request_lock = threading.Lock()
-last_wikimedia_request_at = 0.0
+global_history_lock = threading.Lock()   # guards global_history.json read-modify-write
+
+
+class BoundedCache:
+    """Thread-safe LRU cache with a configurable maximum entry count.
+
+    Uses :class:`collections.OrderedDict` to track insertion/access order.
+    The least-recently-used entry is evicted when ``maxsize`` is exceeded.
+    Replaces the plain ``dict`` + separate ``threading.Lock`` pattern used
+    previously, which grew without bound.
+    """
+
+    def __init__(self, maxsize: int = 2000) -> None:
+        self._data: collections.OrderedDict = collections.OrderedDict()
+        self._maxsize = maxsize
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            value = self._data.get(key)
+            if value is not None:
+                self._data.move_to_end(key)
+            return value
+
+    def set(self, key, value) -> None:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = value
+            while len(self._data) > self._maxsize:
+                self._data.popitem(last=False)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+
+CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "2000"))
+
+image_url_validation_cache: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
+portrait_resolution_cache: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
+wikipedia_person_summary_cache: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
+wikidata_entity_cache: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
+status_verification_cache: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
 
 
 def perf_now() -> float:
@@ -722,13 +606,42 @@ def log_perf(stage: str, started_at: float, **fields) -> float:
     if PERF_LOG_ENABLED:
         payload = {"stage": stage, "duration_ms": duration_ms, **fields}
         logger.info("perf %s", json.dumps(payload, sort_keys=True, default=str))
-        if GEMINI_AUDIT_LOG_ENABLED:
-            append_gemini_audit_log("perf", **payload)
     return duration_ms
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _rotate_audit_log_if_needed() -> None:
+    """Rotate the audit log if it exceeds GEMINI_AUDIT_LOG_MAX_BYTES.
+    Caller must already hold gemini_audit_log_lock.
+    Produces up to GEMINI_AUDIT_LOG_BACKUP_COUNT numbered backup files
+    (e.g. gemini_audit.1.jsonl, gemini_audit.2.jsonl, …).
+    """
+    if GEMINI_AUDIT_LOG_MAX_BYTES <= 0:
+        return
+    try:
+        size = GEMINI_AUDIT_LOG_FILE.stat().st_size if GEMINI_AUDIT_LOG_FILE.exists() else 0
+    except OSError:
+        return
+    if size < GEMINI_AUDIT_LOG_MAX_BYTES:
+        return
+    # Shift existing backups: .2 → .3, .1 → .2
+    for i in range(GEMINI_AUDIT_LOG_BACKUP_COUNT - 1, 0, -1):
+        src = GEMINI_AUDIT_LOG_FILE.with_suffix(f".{i}.jsonl")
+        dst = GEMINI_AUDIT_LOG_FILE.with_suffix(f".{i + 1}.jsonl")
+        try:
+            if src.exists():
+                src.replace(dst)
+        except OSError as exc:
+            logger.warning("Audit log rotation shift failed (%s → %s): %s", src.name, dst.name, exc)
+    # Move the active log to .1
+    try:
+        GEMINI_AUDIT_LOG_FILE.replace(GEMINI_AUDIT_LOG_FILE.with_suffix(".1.jsonl"))
+        logger.info("Audit log rotated: %s", GEMINI_AUDIT_LOG_FILE.name)
+    except OSError as exc:
+        logger.warning("Audit log rotation failed: %s", exc)
 
 
 def append_gemini_audit_log(event_type: str, **fields) -> None:
@@ -745,104 +658,12 @@ def append_gemini_audit_log(event_type: str, **fields) -> None:
         GEMINI_AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
         with gemini_audit_log_lock:
+            _rotate_audit_log_if_needed()
             with GEMINI_AUDIT_LOG_FILE.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
     except Exception as exc:
         logger.warning("Failed to write Gemini audit log: %s", exc)
 
-
-def persist_portrait_resolution_cache() -> None:
-    try:
-        records: list[dict[str, str]] = []
-        with portrait_resolution_lock:
-            for cache_key, cached_value in portrait_resolution_cache.items():
-                ok, image_source = cached_value
-                if not ok or not str(image_source).lower().startswith(("http://", "https://")):
-                    continue
-                person_name_key, portrait_query_key, profession_hint = cache_key
-                records.append(
-                    {
-                        "person_name_key": person_name_key,
-                        "portrait_query_key": portrait_query_key,
-                        "profession_hint": profession_hint or "",
-                        "image_source": image_source,
-                    }
-                )
-        if PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES > 0:
-            records = records[-PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES:]
-        PORTRAIT_RESOLUTION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = PORTRAIT_RESOLUTION_CACHE_FILE.with_suffix(
-            PORTRAIT_RESOLUTION_CACHE_FILE.suffix + ".tmp"
-        )
-        temp_path.write_text(
-            json.dumps(records, ensure_ascii=True, sort_keys=True),
-            encoding="utf-8",
-        )
-        temp_path.replace(PORTRAIT_RESOLUTION_CACHE_FILE)
-    except Exception as exc:
-        logger.warning("Failed to persist portrait resolution cache: %s", exc)
-
-
-def load_portrait_resolution_cache() -> None:
-    if not PORTRAIT_RESOLUTION_CACHE_FILE.exists():
-        return
-    try:
-        payload = json.loads(PORTRAIT_RESOLUTION_CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Failed to load portrait resolution cache: %s", exc)
-        return
-
-    if isinstance(payload, dict):
-        records = payload.get("entries", [])
-    else:
-        records = payload
-    if not isinstance(records, list):
-        return
-
-    loaded = 0
-    with portrait_resolution_lock:
-        for record in records[-PORTRAIT_RESOLUTION_CACHE_MAX_ENTRIES:]:
-            if not isinstance(record, dict):
-                continue
-            person_name_key = str(record.get("person_name_key", "")).strip().casefold()
-            portrait_query_key = str(record.get("portrait_query_key", "")).strip().casefold()
-            profession_hint = str(record.get("profession_hint", "")).strip().casefold()
-            image_source = str(record.get("image_source", "")).strip()
-            if not person_name_key or not portrait_query_key or not image_source:
-                continue
-            if not image_source.lower().startswith(("http://", "https://")):
-                continue
-            portrait_resolution_cache[
-                (person_name_key, portrait_query_key, profession_hint)
-            ] = (True, image_source)
-            loaded += 1
-    if loaded:
-        logger.info(
-            "Loaded %s portrait URL cache entries from %s",
-            loaded,
-            PORTRAIT_RESOLUTION_CACHE_FILE,
-        )
-
-
-def remember_successful_portrait_resolution(
-    cache_key: tuple[str, str, str],
-    image_source: str,
-) -> None:
-    with portrait_resolution_lock:
-        portrait_resolution_cache.pop(cache_key, None)
-        portrait_resolution_cache[cache_key] = (True, image_source)
-    persist_portrait_resolution_cache()
-
-
-def forget_portrait_resolution(cache_key: tuple[str, str, str]) -> None:
-    removed = False
-    with portrait_resolution_lock:
-        removed = portrait_resolution_cache.pop(cache_key, None) is not None
-    if removed:
-        persist_portrait_resolution_cache()
-
-
-load_portrait_resolution_cache()
 
 SYSTEM_PROMPT = """
 Generate exactly one round for an "Alive or Dead" guessing game.
@@ -850,29 +671,22 @@ Generate exactly one round for an "Alive or Dead" guessing game.
 Return only raw JSON with:
 - `person_name`
 - `actual_status`
-- `date_of_birth`
-- `date_of_death`
 - `portrait_search_query`
-- `next_round_label`
 - `guessing_ui_html`
 - `reveal_ui_html`
 
+Critical forbidden-list compliance:
+- The forbidden list is authoritative and overrides every other instruction.
+- Before you write any JSON, internally pick a candidate, normalize them to their canonical common public name, and compare that name against every forbidden entry case-insensitively.
+- If the candidate is an exact match, near match, alias, nickname, title variation, stage name variation, spelling variation, or you are not fully sure they are different, discard them and choose a different person.
+- Treat uncertainty as forbidden.
+- Do not output a forbidden person and do not explain retries; silently retry internally until `person_name` is definitely not in the forbidden list.
+- Output `person_name` only as the canonical common public name you checked against the forbidden list. Do not use honorifics, titles, or alternate spellings.
+
 Round requirements:
-- The prompt header will supply the exact locked person and, usually, the exact locked status to use.
-- Do not pick a different person.
-- Do not reinterpret, alias, shorten, or rewrite the supplied `person_name`.
-- If a locked `actual_status` is supplied in the prompt header, use it exactly as given.
-- Always return `date_of_birth` in `YYYY-MM-DD` format.
-- If `actual_status` is `dead`, return `date_of_death` in `YYYY-MM-DD` format.
-- If `actual_status` is `alive`, return `date_of_death` as `null`.
-- Use real biographical dates that match the returned status. Do not guess inconsistent dates.
-- Theme the UI around what the person is most famous for, but do not default to the same composition or design language every time.
-- Make each round feel visually distinct. Vary composition, information density, panel structure, accents, pacing, and typography treatment from round to round.
-- Choose the layout that best fits the person. It can be poster-like, editorial, tabloid, scoreboard-like, magazine-like, dossier-like, ticket-like, stage-like, or another strong visual direction.
-- The main round card must stay comfortably wide on desktop and mobile. Do not collapse the entire guessing page into a skinny centered column.
-- Keep the entire round compact enough to fit on one screen. Prefer a single card with short copy and minimal nested wrappers over a sprawling poster layout.
-- Aim for HTML that stays under about 2200 characters.
-- Push the creative treatment further than a normal app card. Be bold, thematic, and visually specific.
+- Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable.
+- Never pick anyone from the forbidden list in the user prompt.
+- Theme the UI around what the person is most famous for. Example: Ozzy Osbourne can imply stage lighting, guitar shapes, tour-poster energy.
 - The guessing page must include:
   - the person's name as the biggest text
   - one short status-neutral description of what they are most famous for
@@ -880,9 +694,7 @@ Round requirements:
   - exactly one portrait `<img>` whose `src` is the exact literal `__PORTRAIT_IMAGE_URL__`
   - `submitGuess('alive')` and `submitGuess('dead')` buttons
 - The reveal page must match the same theme and include `loadNextRound()`.
-- The reveal page should include a compact factual date reference using the returned date fields, especially for the verdict moment, and should display those dates in a human-readable format like `April 5th, 2006` rather than raw ISO strings.
-- Return `next_round_label` as a short, creative, celebrity-specific label for the `loadNextRound()` button. It should feel tailored to the subject's world, such as a catchphrase, encore, sequel cue, or related phrase, and should stay concise.
-- The reveal page button text should use `next_round_label` exactly, not a generic `Next Round` label.
+- The person cannot be one of these formerly selected people: [NAMELIST]
 
 Output rules:
 - Tailwind classes only. No <script>, <style>, <html>, <body>, <head>, markdown fences, SVG data URIs, or base64.
@@ -895,21 +707,6 @@ Output rules:
 - The guessing page must contain exactly one `<img>` whose `src` is the exact literal `__PORTRAIT_IMAGE_URL__`.
 - The reveal page may omit the portrait, but if it includes one, it must reuse the exact same `__PORTRAIT_IMAGE_URL__` placeholder.
 - Do not place `__PORTRAIT_IMAGE_URL__` anywhere except an `<img src>` attribute.
-- The single portrait image may be used boldly, but on the guessing page it should still read as a recognizable portrait rather than disappearing into pure texture.
-- Keep the actual portrait photo sharp and readable. Do not blur, heavily soften, smear, or defocus the `<img>` itself.
-- Atmospheric treatments are allowed around the portrait with normal background layers, glows, gradients, or decorative shapes, but the actual portrait photo must remain crisp.
-- Avoid turning the only guessing-page portrait into a totally abstract background wash unless the rest of the composition is especially strong and readable.
-- Never repeat `__PORTRAIT_IMAGE_URL__` in CSS `url(...)`, inline styles, text, data attributes, masks, pseudo-background tricks, or additional `<img>` tags.
-- Treat the portrait as one physical photo element. Build frames, glows, overlays, shadows, spotlights, and scenery around it with normal `<div>` layers, not by duplicating the portrait placeholder.
-- Preserve the subject's face as a focal point. Keep the eyes and upper face clearly visible and readable in the final composition.
-- Do not place large opaque text panels, badges, white fades, or heavy overlays across the eyes, forehead, or central face area.
-- If text overlaps the portrait at all, place it in lower-third or side negative-space zones and keep the face unobstructed.
-- Avoid crops or overlay treatments that make the portrait feel cut off at the eyes or washed out through the middle of the face.
-- The full `person_name` must remain fully visible and readable. Never clip, crop, truncate, or push part of the name off-canvas.
-- If the name is long, reduce the type size or wrap it cleanly instead of letting the text overflow outside its container.
-- The name block must fit fully inside its panel with comfortable side padding. Do not let oversized display text run into the panel edge or off the right side of the card.
-- For long names in split or poster layouts, prefer smaller headline sizes, more line breaks, or a wider text column instead of extreme oversized typography.
-- Avoid giant serif or ultra-wide headline treatments for long names unless you are certain the full name still fits inside the visible card bounds on both desktop and mobile.
 - Put the `submitGuess('alive')` and `submitGuess('dead')` buttons in a dedicated controls block outside the portrait area.
 - The guess buttons must never overlap the portrait, float over the portrait, or appear inside the portrait panel.
 - Do not use absolute or fixed positioning, inset utilities, negative margins, or translate utilities to place the guess buttons over the image.
@@ -917,24 +714,10 @@ Output rules:
 - If you need a square or shaped portrait area, use core Tailwind utilities like `aspect-square`, explicit `h-*`, `w-*`, `min-h-*`, and normal layout sizing instead.
 - Do not use any remote URL or CSS `url(...)` inside backgrounds, overlays, masks, or decorative styles.
 - Do not include extra `<img>` tags for logos, title cards, decorative textures, or background art.
-- Be creatively ambitious within the HTML/Tailwind-only constraint. Use hierarchy, asymmetry, sections, badges, dividers, callouts, kicker labels, stat blocks, atmospheric color, and other layout devices when they fit.
-- Built-in Tailwind animation and transition classes are allowed. Use a few purposeful motions like pulse, bounce, spin, shimmer-like movement, drifting lights, or reveal energy when they fit the theme.
-- You may build thematic scenery and props from plain HTML/CSS structure alone: for example a TV frame for a TV star, stage lights or curtains for a performer, guitar-like silhouettes for a musician, marquees, tickets, tabloid bursts, scoreboards, dossiers, or dramatic spotlights.
-- You may use absolute-positioned decorative layers, borders, glows, gradients, blur, rotations, and atmospheric shapes for non-button elements.
-- Avoid repeating the same safe layout shell. Do not default to a generic centered card or the same two-column composition every round unless it is clearly the strongest fit for that person.
-- Avoid repeating the same typography formula, same badge placement, same image treatment, or same information order every round.
-- The reveal page should feel like a deliberate continuation or escalation of the guessing page concept, not just the same shell with new text.
-- Keep each HTML fragment concise, but you may use richer structure and more layered presentation. Target under 3000 characters.
+- If you want atmosphere, use gradients, borders, overlays, badges, shapes, labels, and typography.
+- Keep each HTML fragment concise. Target under 1400 characters.
+- Prefer a bold split layout or layered poster layout, not a generic centered card.
 - Keep button text high contrast.
-- Guess buttons must be visibly enabled, clickable, and high contrast. Never use disabled attributes, `pointer-events-none`, `cursor-not-allowed`, low-opacity classes, or disabled-state styling on the Alive/Dead buttons.
-- Do not include literal backslash escape sequences like `\\n`, `\\r`, or `\\t` in the final HTML fragments.
-- Design for a single-screen experience. The full guessing page and reveal page should fit comfortably in a normal desktop browser viewport without requiring vertical scrolling.
-- Prefer compact spacing, restrained portrait sizing, and tighter composition when needed so the entire round is visible at once.
-- Do not build tall poster layouts that push the buttons or key copy below the fold.
-
-Reveal wording:
-- Use present tense for the final status. Say `is alive` or `is dead`, not `was alive` or `was dead`.
-- Do not describe the status itself in past tense, even when the person is dead.
 
 Spoiler rules for the guessing page:
 - Never mention death, assassination, murder, funeral, memorial, burial, "late", "still alive", or any status-revealing phrasing.
@@ -946,28 +729,21 @@ Spoiler rules for the guessing page:
 
 
 CANDIDATE_SELECTION_PROMPT = """
-Generate candidate people for one session of an "Alive or Dead" guessing game.
+Generate candidate people for one round of an "Alive or Dead" guessing game.
 
 Return only raw JSON with:
 - `candidates`
 
 Candidate rules:
 - Return exactly [CANDIDATE_COUNT] candidates.
-- The backend will choose a 10-person round plan from your larger candidate list, so give a deep, varied bench instead of a short list of obvious staples.
-- Each candidate must include:
-  - `person_name`
-  - `actual_status`
-- `actual_status` must be exactly `alive` or `dead`. Never use `deceased`, `passed away`, `late`, or any other synonym.
-- Pick famous people whose birth year is between [MIN_BIRTH_YEAR] and [MAX_BIRTH_YEAR], so their age would plausibly be between [MIN_AGE] and [MAX_AGE] years old today.
-- Do not return historical figures, ancient celebrities, or anyone obviously far outside that birth-year window.
-- Their status should still feel genuinely guessable to a modern player.
+- Each candidate must include `person_name`.
+- Do not include `actual_status`; the backend verifies current vital status from Wikidata before the person can be used.
+- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable.
 - Never return anyone from the forbidden list in the user prompt.
 - Use canonical common public names only.
 - Do not include duplicate people, aliases of the same person, or close variants of the same name.
 - Prefer a diverse set of candidates instead of repeating the same obvious names.
-- Do not default to the same obituary-canon or trivia-canon staples over and over.
-- If many obvious celebrity staples are already forbidden, pivot hard into less overused but still broadly recognizable famous people.
-- Spread the list across different eras and domains such as film, television, music, sports, public life, and culture rather than clustering around the same few classic dead celebrities.
+- If many obvious celebrity staples are already forbidden, go deeper and return less overused but still guessable famous people.
 
 Critical forbidden-list compliance:
 - The forbidden list is authoritative and overrides every other instruction.
@@ -979,6 +755,12 @@ Critical forbidden-list compliance:
 
 
 def extract_json(text: str) -> dict | list | None:
+    # Fast path: model returned clean JSON with no surrounding prose.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
     try:
         object_start = text.find("{")
         array_start = text.find("[")
@@ -1019,6 +801,17 @@ def extract_json(text: str) -> dict | list | None:
     return None
 
 
+def get_global_history() -> list[str]:
+    try:
+        if GLOBAL_HISTORY_FILE.exists():
+            content = GLOBAL_HISTORY_FILE.read_text(encoding="utf-8").strip()
+            if content:
+                return json.loads(content)
+    except Exception as exc:
+        logger.error("Failed to read global history: %s", exc)
+    return []
+
+
 def merge_names_recency_preserving(existing_names: list[str], incoming_names: list[str]) -> list[str]:
     merged = list(existing_names)
     for raw_name in incoming_names:
@@ -1031,407 +824,32 @@ def merge_names_recency_preserving(existing_names: list[str], incoming_names: li
     return merged
 
 
-def trim_fifo_names(names: list[str], max_names: int) -> list[str]:
-    if max_names <= 0:
-        return []
-    return list(names[-max_names:])
-
-
-def normalize_client_ip(raw_ip: str | None) -> str:
-    normalized = " ".join(str(raw_ip or "").split())
-    return normalized.casefold() if normalized else "unknown"
-
-
-def extract_client_ip(request: FastAPIRequest) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip", "").strip()
-    if real_ip:
-        return real_ip
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
-
-
-def read_ip_histories_unlocked() -> dict[str, list[str]]:
-    try:
-        if IP_HISTORY_FILE.exists():
-            content = IP_HISTORY_FILE.read_text(encoding="utf-8").strip()
-            if content:
-                payload = json.loads(content)
-                if isinstance(payload, dict):
-                    histories: dict[str, list[str]] = {}
-                    for raw_ip, raw_names in payload.items():
-                        if not isinstance(raw_names, list):
-                            continue
-                        histories[normalize_client_ip(raw_ip)] = trim_fifo_names(
-                            merge_names_recency_preserving([], raw_names),
-                            IP_HISTORY_MAX_NAMES,
-                        )
-                    return histories
-    except Exception as exc:
-        logger.error("Failed to read IP history: %s", exc)
-    return {}
-
-
-def write_ip_histories_unlocked(histories: dict[str, list[str]]) -> None:
-    normalized_histories: dict[str, list[str]] = {}
-    for raw_ip, raw_names in histories.items():
-        ip_key = normalize_client_ip(raw_ip)
-        if not ip_key:
-            continue
-        normalized_histories[ip_key] = trim_fifo_names(
-            merge_names_recency_preserving([], raw_names),
-            IP_HISTORY_MAX_NAMES,
-        )
-    IP_HISTORY_FILE.write_text(
-        json.dumps(normalized_histories, ensure_ascii=True),
-        encoding="utf-8",
-    )
-
-
-def get_ip_history(client_ip_key: str) -> list[str]:
-    with ip_history_lock:
-        histories = read_ip_histories_unlocked()
-        return list(histories.get(normalize_client_ip(client_ip_key), []))
-
-
-def update_ip_history(client_ip_key: str, names: list[str]) -> list[str]:
-    ip_key = normalize_client_ip(client_ip_key)
-    with ip_history_lock:
-        histories = read_ip_histories_unlocked()
-        history = merge_names_recency_preserving(histories.get(ip_key, []), names)
-        history = trim_fifo_names(history, IP_HISTORY_MAX_NAMES)
-        histories[ip_key] = history
-        write_ip_histories_unlocked(histories)
-    for name in names:
-        if name:
-            forget_candidate_from_ip_pool(ip_key, name)
-    return list(history)
-
-
-def candidate_bank_entry_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def prune_candidate_like_entries(entries: list[dict], ttl_seconds: int, max_entries: int) -> list[dict]:
-    if not entries:
-        return []
-
-    cutoff_ts = time.time() - max(ttl_seconds, 0)
-    deduped: list[dict] = []
-    seen: set[str] = set()
-
-    for raw_entry in reversed(entries):
-        if not isinstance(raw_entry, dict):
-            continue
-        person_name = " ".join(str(raw_entry.get("person_name", "")).split())
-        if not person_name:
-            continue
-        actual_status = str(raw_entry.get("actual_status", "")).strip().lower()
-        if actual_status not in {"alive", "dead"}:
-            continue
-        normalized_key = normalize_name_key(person_name)
-        if normalized_key in seen:
-            continue
-        updated_at_raw = str(raw_entry.get("updated_at", "")).strip()
-        updated_at_dt: datetime | None = None
-        if updated_at_raw:
-            try:
-                updated_at_dt = datetime.fromisoformat(updated_at_raw.replace("Z", "+00:00"))
-            except ValueError:
-                updated_at_dt = None
-        if updated_at_dt is not None and updated_at_dt.timestamp() < cutoff_ts:
-            continue
-        seen.add(normalized_key)
-        deduped.append(
-            {
-                "person_name": person_name,
-                "actual_status": actual_status,
-                "updated_at": updated_at_dt.isoformat() if updated_at_dt else candidate_bank_entry_timestamp(),
-            }
-        )
-
-    deduped.reverse()
-    if len(deduped) > max_entries:
-        deduped = deduped[-max_entries:]
-    return deduped
-
-
-def read_ip_candidate_pools_unlocked() -> dict[str, list[dict]]:
-    try:
-        if CANDIDATE_IP_POOL_FILE.exists():
-            content = CANDIDATE_IP_POOL_FILE.read_text(encoding="utf-8").strip()
-            if content:
-                payload = json.loads(content)
-                if isinstance(payload, dict):
-                    normalized: dict[str, list[dict]] = {}
-                    for raw_ip_key, raw_entries in payload.items():
-                        if not isinstance(raw_entries, list):
-                            continue
-                        ip_key = normalize_client_ip(str(raw_ip_key))
-                        normalized_entries = prune_candidate_like_entries(
-                            raw_entries,
-                            IP_CANDIDATE_POOL_TTL_SECONDS,
-                            IP_CANDIDATE_POOL_MAX_ENTRIES,
-                        )
-                        if normalized_entries:
-                            normalized[ip_key] = normalized_entries
-                    return normalized
-    except Exception as exc:
-        logger.error("Failed to read IP candidate pools: %s", exc)
-    return {}
-
-
-def write_ip_candidate_pools_unlocked(pools: dict[str, list[dict]]) -> None:
-    normalized: dict[str, list[dict]] = {}
-    for raw_ip_key, raw_entries in pools.items():
-        if not isinstance(raw_entries, list):
-            continue
-        ip_key = normalize_client_ip(str(raw_ip_key))
-        normalized_entries = prune_candidate_like_entries(
-            raw_entries,
-            IP_CANDIDATE_POOL_TTL_SECONDS,
-            IP_CANDIDATE_POOL_MAX_ENTRIES,
-        )
-        if normalized_entries:
-            normalized[ip_key] = normalized_entries
-    CANDIDATE_IP_POOL_FILE.write_text(
-        json.dumps(normalized, ensure_ascii=True),
-        encoding="utf-8",
-    )
-
-
-def select_candidates_from_ip_pool(client_ip_key: str, forbidden: list[str], limit: int) -> list[LockedCandidate]:
-    if limit <= 0:
-        return []
-    ip_key = normalize_client_ip(client_ip_key)
-    forbidden_keys = {normalize_name_key(name) for name in forbidden}
-    selected: list[LockedCandidate] = []
-    selected_keys: set[str] = set()
-    rejected_names: list[str] = []
-    with candidate_ip_pool_lock:
-        pools = read_ip_candidate_pools_unlocked()
-        entries = list(pools.get(ip_key, []))
-
-    for entry in reversed(entries):
-        person_name = str(entry.get("person_name", ""))
-        actual_status = str(entry.get("actual_status", "")).strip().lower() or None
-        key = normalize_name_key(person_name)
-        if not person_name or key in forbidden_keys or key in selected_keys:
-            continue
-        plausible = resolve_candidate_age_plausibility(person_name)
-        if plausible is False:
-            rejected_names.append(person_name)
-            continue
-        selected_keys.add(key)
-        selected.append(
-            LockedCandidate(
-                person_name=person_name,
-                actual_status=actual_status,
-                source="ip_candidate_pool",
-            )
-        )
-        if len(selected) >= limit:
-            break
-
-    for person_name in rejected_names:
-        forget_candidate_from_ip_pool(ip_key, person_name)
-
-    return selected
-
-
-def remember_candidates_for_ip_pool(client_ip_key: str, candidates: list[LockedCandidate]) -> None:
-    if not candidates:
-        return
-    ip_key = normalize_client_ip(client_ip_key)
-    new_entries = [
-        {
-            "person_name": " ".join(candidate.person_name.split()),
-            "actual_status": (candidate.actual_status or "").strip().lower(),
-            "updated_at": candidate_bank_entry_timestamp(),
-        }
-        for candidate in candidates
-        if candidate.person_name and (candidate.actual_status or "").strip().lower() in {"alive", "dead"}
-    ]
-    if not new_entries:
-        return
-    with candidate_ip_pool_lock:
-        pools = read_ip_candidate_pools_unlocked()
-        entries = list(pools.get(ip_key, []))
-        entries.extend(new_entries)
-        pools[ip_key] = entries
-        write_ip_candidate_pools_unlocked(pools)
-
-
-def forget_candidate_from_ip_pool(client_ip_key: str, person_name: str) -> None:
-    ip_key = normalize_client_ip(client_ip_key)
-    person_key = normalize_name_key(person_name)
-    with candidate_ip_pool_lock:
-        pools = read_ip_candidate_pools_unlocked()
-        entries = pools.get(ip_key, [])
-        filtered = [
-            entry
-            for entry in entries
-            if normalize_name_key(str(entry.get("person_name", ""))) != person_key
-        ]
-        if filtered:
-            pools[ip_key] = filtered
-        elif ip_key in pools:
-            pools.pop(ip_key, None)
-        if len(filtered) != len(entries):
-            write_ip_candidate_pools_unlocked(pools)
-
-
-def prune_candidate_bank_entries(entries: list[dict]) -> list[dict]:
-    return prune_candidate_like_entries(
-        entries,
-        CANDIDATE_BANK_TTL_SECONDS,
-        CANDIDATE_BANK_MAX_ENTRIES,
-    )
-
-
-def read_candidate_bank_unlocked() -> list[dict]:
-    try:
-        if CANDIDATE_BANK_FILE.exists():
-            content = CANDIDATE_BANK_FILE.read_text(encoding="utf-8").strip()
-            if content:
-                payload = json.loads(content)
-                if isinstance(payload, list):
-                    return prune_candidate_bank_entries(payload)
-    except Exception as exc:
-        logger.error("Failed to read candidate bank: %s", exc)
-    return []
-
-
-def write_candidate_bank_unlocked(entries: list[dict]) -> None:
-    normalized_entries = prune_candidate_bank_entries(entries)
-    CANDIDATE_BANK_FILE.write_text(
-        json.dumps(normalized_entries, ensure_ascii=True),
-        encoding="utf-8",
-    )
-
-
-def select_candidates_from_bank(forbidden: list[str], limit: int) -> list[LockedCandidate]:
-    if limit <= 0:
-        return []
-    forbidden_keys = {normalize_name_key(name) for name in forbidden}
-    selected: list[LockedCandidate] = []
-    selected_keys: set[str] = set()
-    rejected_names: list[str] = []
-    with candidate_bank_lock:
-        entries = read_candidate_bank_unlocked()
-
-    for entry in reversed(entries):
-        person_name = str(entry.get("person_name", ""))
-        actual_status = str(entry.get("actual_status", "")).strip().lower() or None
-        key = normalize_name_key(person_name)
-        if not person_name or key in forbidden_keys or key in selected_keys:
-            continue
-        plausible = resolve_candidate_age_plausibility(person_name)
-        if plausible is False:
-            rejected_names.append(person_name)
-            continue
-        selected_keys.add(key)
-        selected.append(
-            LockedCandidate(
-                person_name=person_name,
-                actual_status=actual_status,
-                source="candidate_bank",
-            )
-        )
-        if len(selected) >= limit:
-            break
-
-    for person_name in rejected_names:
-        forget_candidate_from_bank(person_name)
-
-    return selected
-
-
-def remember_candidates_in_bank(candidates: list[LockedCandidate]) -> None:
-    if not candidates:
-        return
-    new_entries = [
-        {
-            "person_name": " ".join(candidate.person_name.split()),
-            "actual_status": (candidate.actual_status or "").strip().lower(),
-            "updated_at": candidate_bank_entry_timestamp(),
-        }
-        for candidate in candidates
-        if candidate.person_name and (candidate.actual_status or "").strip().lower() in {"alive", "dead"}
-    ]
-    if not new_entries:
-        return
-    with candidate_bank_lock:
-        entries = read_candidate_bank_unlocked()
-        entries.extend(new_entries)
-        write_candidate_bank_unlocked(entries)
-
-
-def forget_candidate_from_bank(person_name: str) -> None:
-    person_key = normalize_name_key(person_name)
-    with candidate_bank_lock:
-        entries = read_candidate_bank_unlocked()
-        filtered = [
-            entry
-            for entry in entries
-            if normalize_name_key(str(entry.get("person_name", ""))) != person_key
-        ]
-        if len(filtered) != len(entries):
-            write_candidate_bank_unlocked(filtered)
-
-
-def url_targets_wikimedia(url: str) -> bool:
-    lowered = url.lower()
-    return (
-        "wikimedia.org" in lowered
-        or "wikipedia.org" in lowered
-        or "wikidata.org" in lowered
-    )
-
-
-def wait_for_wikimedia_request_slot(url: str) -> None:
-    if not url_targets_wikimedia(url):
-        return
-
-    global last_wikimedia_request_at
-    min_interval_seconds = max(WIKIMEDIA_MIN_REQUEST_INTERVAL_MS, 0.0) / 1000.0
-    if min_interval_seconds <= 0:
-        return
-
-    with wikimedia_request_lock:
-        elapsed = time.monotonic() - last_wikimedia_request_at
-        remaining = min_interval_seconds - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-        last_wikimedia_request_at = time.monotonic()
-
-
-def collect_ip_reserved_names(client_ip_key: str, exclude_session_id: str | None = None) -> list[str]:
-    reserved_names: list[str] = []
-    normalized_ip = normalize_client_ip(client_ip_key)
-    for session_id, session in sessions.items():
-        if exclude_session_id and session_id == exclude_session_id:
-            continue
+def update_global_history(names: list[str]) -> None:
+    with global_history_lock:
         try:
-            round_number = int(session.get("round_number", 0))
-        except (TypeError, ValueError):
-            continue
-        if round_number >= ROUNDS_PER_GAME:
-            continue
-        if normalize_client_ip(session.get("client_ip_key")) != normalized_ip:
-            continue
-        reserved_names.extend(session.get("reserved_names", []))
-    return merge_names_recency_preserving([], reserved_names)
+            history = get_global_history()
+            history = merge_names_recency_preserving(history, names)
+            GLOBAL_HISTORY_FILE.write_text(json.dumps(history), encoding="utf-8")
+        except Exception as exc:
+            logger.error("Failed to update global history: %s", exc)
 
 
 def build_generation_prompt(
+    forbidden: list[str],
     retry_notes: list[str] | None = None,
     locked_person_name: str | None = None,
     locked_actual_status: str | None = None,
 ) -> str:
+    if locked_person_name:
+        forbidden_tail = (
+            "None. The backend has already preselected and checked the locked person; "
+            "use only the locked person."
+        )
+    elif forbidden:
+        forbidden_tail = ", ".join(list(dict.fromkeys(forbidden)))
+    else:
+        forbidden_tail = "None"
+
     retry_section = ""
     if retry_notes:
         deduped_notes = list(dict.fromkeys(note.strip() for note in retry_notes if note.strip()))
@@ -1458,13 +876,13 @@ def build_generation_prompt(
                 "- The locked person overrides any generic instruction to pick someone.\n\n"
             )
 
-    prompt_body = locked_section + SYSTEM_PROMPT
+    prompt_body = SYSTEM_PROMPT.replace("[NAMELIST]", forbidden_tail)
+    prompt_body = locked_section + prompt_body
     return f"{prompt_body}\n\n{retry_section}Return one complete round only."
 
 
 def build_candidate_selection_prompt(
     forbidden: list[str],
-    candidate_count: int,
     retry_notes: list[str] | None = None,
 ) -> str:
     if forbidden:
@@ -1478,14 +896,7 @@ def build_candidate_selection_prompt(
         if deduped_notes:
             retry_section = "Retry notes:\n" + "\n".join(f"- {note}" for note in deduped_notes) + "\n\n"
 
-    prompt_body = (
-        CANDIDATE_SELECTION_PROMPT
-        .replace("[CANDIDATE_COUNT]", str(candidate_count))
-        .replace("[MIN_BIRTH_YEAR]", str(PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR))
-        .replace("[MAX_BIRTH_YEAR]", str(PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR))
-        .replace("[MIN_AGE]", str(PLAUSIBLE_CANDIDATE_MIN_AGE))
-        .replace("[MAX_AGE]", str(PLAUSIBLE_CANDIDATE_MAX_AGE))
-    )
+    prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
     return (
         "CRITICAL FORBIDDEN LIST:\n"
         f"[{forbidden_tail}]\n\n"
@@ -1496,12 +907,6 @@ def build_candidate_selection_prompt(
 
 
 def build_retry_note(error_message: str) -> str:
-    lowered = error_message.lower()
-    if "actual_status" in lowered and "deceased" in lowered:
-        return (
-            "Your previous attempt used the invalid status word 'deceased'. "
-            "Use exactly `alive` or `dead` for `actual_status`; never use synonyms."
-        )
     if error_message.startswith("Model returned forbidden person:"):
         person_name = error_message.split(": ", 1)[1]
         return (
@@ -1513,40 +918,10 @@ def build_retry_note(error_message: str) -> str:
             "Your previous attempt returned invalid or truncated JSON. "
             "Return only one complete raw JSON object with fully closed braces, valid double-quoted strings, and no prose before or after."
         )
-    if (
-        "Candidate selection returned no allowed person" in error_message
-        or "Candidate negotiation returned no newly allowed people" in error_message
-    ):
-        rejected_tail = ""
-        if "Rejected candidates:" in error_message:
-            rejected_tail = error_message.split("Rejected candidates:", 1)[1].strip()
+    if "Candidate selection returned no allowed person" in error_message:
         return (
             "Your previous candidate list did not contain any allowed person. "
-            "Return a much more diverse candidate list, avoid obvious or previously used names, and go deeper than the usual celebrity staples. "
-            + (
-                f"Do not reuse these rejected examples: {rejected_tail}. "
-                if rejected_tail and rejected_tail.lower() != "none"
-                else ""
-            )
-        )
-    if "Candidate negotiation returned no plausible-age people" in error_message:
-        rejected_tail = ""
-        if "Rejected candidates:" in error_message:
-            rejected_tail = error_message.split("Rejected candidates:", 1)[1].strip()
-        return (
-            "Your previous candidate list used people who are obviously outside the game's age window. "
-            f"Only return celebrities born between {PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR} and {PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR}. "
-            "Do not return historical figures, very recent children, or anyone clearly outside that range. "
-            + (
-                f"Do not reuse these rejected examples: {rejected_tail}. "
-                if rejected_tail and rejected_tail.lower() != "none"
-                else ""
-            )
-        )
-    if "date_of_birth" in error_message or "date_of_death" in error_message:
-        return (
-            "Your previous attempt returned inconsistent or invalid date fields. "
-            "Return `date_of_birth` in YYYY-MM-DD format, return `date_of_death` only for dead people, use `null` for alive people, and keep the dates consistent with `actual_status`."
+            "Return a much more diverse candidate list, avoid obvious or previously used names, and go deeper than the usual celebrity staples."
         )
     if "locked person" in error_message.lower() or "locked status" in error_message.lower():
         return (
@@ -1561,16 +936,7 @@ def build_retry_note(error_message: str) -> str:
     if "portrait placeholder" in error_message or "old image placeholder" in error_message:
         return (
             "Your previous attempt used the image slot incorrectly. "
-            f"Use exactly one portrait `<img src>` with the exact literal `{PORTRAIT_IMAGE_PLACEHOLDER}`. "
-            "Do not place the placeholder in CSS `url(...)`, inline styles, text, data attributes, or extra `<img>` tags. "
-            "If you want a background-like portrait treatment, style that one `<img>` with layout classes and surrounding decorative `<div>` layers instead of repeating the placeholder. "
-            "Do not output a final remote image URL yourself, and if the reveal page also shows a portrait, reuse the same single-placeholder pattern there."
-        )
-    if "portrait presentation" in error_message.lower() or "guessing portrait" in error_message.lower():
-        return (
-            "Your previous attempt made the guessing portrait too abstract or unreadable. "
-            "Keep the single guessing-page portrait sharp, recognizable, and comfortably framed. "
-            "Do not blur it, do not fade it heavily with low opacity, and do not zoom so aggressively that the head is truncated."
+            f"Set the portrait `<img src>` to the exact literal `{PORTRAIT_IMAGE_PLACEHOLDER}`. Do not output a final remote image URL yourself, and if the reveal page also shows a portrait, reuse the same placeholder."
         )
     if "unsupported tailwind class" in error_message.lower():
         return (
@@ -1593,206 +959,9 @@ def build_retry_note(error_message: str) -> str:
     )
 
 
-def trim_retry_notes(retry_notes: list[str], limit: int = 4) -> list[str]:
-    deduped = list(dict.fromkeys(note.strip() for note in retry_notes if note.strip()))
-    if limit <= 0:
-        return []
-    return deduped[-limit:]
-
-
 def extract_visible_text(fragment: str) -> str:
     text = HTML_TAG_RE.sub(" ", fragment)
     return WHITESPACE_RE.sub(" ", text).strip()
-
-
-def normalize_generated_html_fragment(fragment: str) -> str:
-    normalized = str(fragment or "")
-    normalized = normalized.replace("\\r", "\n").replace("\\n", "\n").replace("\\t", " ")
-    return normalized.strip()
-
-
-def wrap_round_fragment(fragment: str) -> str:
-    normalized = normalize_generated_html_fragment(fragment)
-    if not normalized:
-        return normalized
-    return f"<div class='round-fragment w-full'>{normalized}</div>"
-
-
-def format_display_date(iso_date: str) -> str:
-    parsed = datetime.strptime(iso_date, "%Y-%m-%d")
-    day = parsed.day
-    suffix = "th"
-    if day % 100 not in {11, 12, 13}:
-        if day % 10 == 1:
-            suffix = "st"
-        elif day % 10 == 2:
-            suffix = "nd"
-        elif day % 10 == 3:
-            suffix = "rd"
-    return f"{parsed.strftime('%B')} {day}{suffix}, {parsed.year}"
-
-
-def humanize_reveal_dates(fragment: str, date_of_birth: str, date_of_death: str | None) -> str:
-    rewritten = fragment
-    replacements = [date_of_birth]
-    if date_of_death:
-        replacements.append(date_of_death)
-    for iso_date in replacements:
-        rewritten = rewritten.replace(iso_date, format_display_date(iso_date))
-    return rewritten
-
-
-NEXT_ROUND_BUTTON_RE = re.compile(
-    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
-    re.IGNORECASE | re.DOTALL,
-)
-GUESS_BUTTON_RE = re.compile(
-    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])submitGuess\((?P<status_q>['\"])(?P<status>alive|dead)(?P=status_q)\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
-    re.IGNORECASE | re.DOTALL,
-)
-NEXT_ROUND_CONTROL_RE = re.compile(
-    r"<(?P<tag>button|a)\b(?P<attrs>[^>]*\bonclick\s*=\s*(?P<q>['\"])loadNextRound\(\)(?P=q)[^>]*)>(?P<label>.*?)</(?P=tag)>",
-    re.IGNORECASE | re.DOTALL,
-)
-DISABLED_ATTR_RE = re.compile(r"\s+\bdisabled\b(?:\s*=\s*(['\"]).*?\1)?", re.IGNORECASE | re.DOTALL)
-ARIA_DISABLED_ATTR_RE = re.compile(
-    r"\s+\baria-disabled\s*=\s*(['\"])(?:true|1)\1",
-    re.IGNORECASE | re.DOTALL,
-)
-GUESS_BUTTON_DISABLED_CLASS_EXACT = {
-    "cursor-not-allowed",
-    "pointer-events-none",
-}
-GUESS_BUTTON_DISABLED_CLASS_PREFIXES = (
-    "opacity-",
-    "disabled:",
-    "aria-disabled:",
-)
-
-
-def sanitize_next_round_label(label: str | None) -> str:
-    normalized = " ".join(str(label or "").split())
-    normalized = html.escape(normalized or "Next Round", quote=False)
-    if len(normalized) > 80:
-        normalized = normalized[:80].rstrip()
-    return normalized or "Next Round"
-
-
-def add_classes_to_attrs(attrs: str, extra_classes: str) -> str:
-    class_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.IGNORECASE | re.DOTALL)
-    if class_match:
-        quote = class_match.group(1)
-        existing_classes = class_match.group(2).strip()
-        combined_classes = " ".join(
-            part for part in (existing_classes, extra_classes.strip()) if part
-        )
-        replacement = f'class={quote}{combined_classes}{quote}'
-        return attrs[: class_match.start()] + replacement + attrs[class_match.end() :]
-    return f"{attrs} class=\"{extra_classes.strip()}\""
-
-
-def remove_classes_from_attrs(
-    attrs: str,
-    exact_classes: set[str],
-    class_prefixes: tuple[str, ...] = (),
-) -> str:
-    class_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.IGNORECASE | re.DOTALL)
-    if not class_match:
-        return attrs
-    quote = class_match.group(1)
-    kept_classes = [
-        token
-        for token in class_match.group(2).split()
-        if token not in exact_classes and not token.startswith(class_prefixes)
-    ]
-    replacement = f"class={quote}{' '.join(kept_classes)}{quote}"
-    return attrs[: class_match.start()] + replacement + attrs[class_match.end() :]
-
-
-def ensure_guess_buttons_clickable(fragment: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        tag = match.group("tag")
-        attrs = match.group("attrs")
-        label = match.group("label")
-        status = match.group("status").lower()
-        attrs = DISABLED_ATTR_RE.sub("", attrs)
-        attrs = ARIA_DISABLED_ATTR_RE.sub("", attrs)
-        attrs = remove_classes_from_attrs(
-            attrs,
-            GUESS_BUTTON_DISABLED_CLASS_EXACT,
-            GUESS_BUTTON_DISABLED_CLASS_PREFIXES,
-        )
-        attrs = add_classes_to_attrs(
-            attrs,
-            "pointer-events-auto cursor-pointer opacity-100 text-white",
-        )
-        fallback_label = "Alive" if status == "alive" else "Dead"
-        return f"<{tag}{attrs}>{label or fallback_label}</{tag}>"
-
-    return GUESS_BUTTON_RE.sub(repl, fragment)
-
-
-def ensure_next_round_button_clickable(fragment: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        tag = match.group("tag")
-        attrs = match.group("attrs")
-        label = match.group("label")
-        attrs = DISABLED_ATTR_RE.sub("", attrs)
-        attrs = ARIA_DISABLED_ATTR_RE.sub("", attrs)
-        attrs = remove_classes_from_attrs(
-            attrs,
-            GUESS_BUTTON_DISABLED_CLASS_EXACT,
-            GUESS_BUTTON_DISABLED_CLASS_PREFIXES,
-        )
-        attrs = add_classes_to_attrs(
-            attrs,
-            "pointer-events-auto cursor-pointer opacity-100 text-black relative z-50",
-        )
-        return f"<{tag}{attrs}>{label or 'Next Round'}</{tag}>"
-
-    return NEXT_ROUND_CONTROL_RE.sub(repl, fragment, count=1)
-
-
-def normalize_reveal_status_tense(fragment: str) -> str:
-    rewrites = {
-        "was alive": "is alive",
-        "was dead": "is dead",
-        "Was Alive": "Is Alive",
-        "Was Dead": "Is Dead",
-        "WAS ALIVE": "IS ALIVE",
-        "WAS DEAD": "IS DEAD",
-    }
-    normalized = fragment
-    for original, replacement in rewrites.items():
-        normalized = normalized.replace(original, replacement)
-    return normalized
-
-
-def rewrite_next_round_control(fragment: str, label: str, hide_on_mobile: bool = False) -> str:
-    button_label = sanitize_next_round_label(label)
-
-    def repl(match: re.Match[str]) -> str:
-        tag = match.group("tag")
-        attrs = match.group("attrs")
-        if hide_on_mobile:
-            attrs = add_classes_to_attrs(attrs, "hidden md:inline-flex")
-        return f"<{tag}{attrs}>{button_label}</{tag}>"
-
-    return NEXT_ROUND_BUTTON_RE.sub(repl, fragment, count=1)
-
-
-def build_mobile_next_round_bar(label: str) -> str:
-    button_label = sanitize_next_round_label(label)
-    return (
-        "<div class='fixed inset-x-0 bottom-0 z-50 flex justify-center px-4 pb-4 pt-3 md:hidden' "
-        "style='padding-bottom: calc(1rem + env(safe-area-inset-bottom));'>"
-        "<div class='pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black via-black/80 to-transparent'></div>"
-        "<button onclick=\"loadNextRound()\" "
-        "class='pointer-events-auto relative rounded-full border border-white/10 bg-white px-6 py-4 text-sm font-black uppercase tracking-[0.2em] text-black shadow-2xl shadow-black/40 transition hover:scale-105 active:scale-95'>"
-        f"{button_label}"
-        "</button>"
-        "</div>"
-    )
 
 
 def strip_url_query_and_fragment(url: str) -> str:
@@ -1828,48 +997,6 @@ def tokenize_identity_text(text: str) -> list[str]:
         for token in re.findall(r"[a-z0-9]+", normalized)
         if token and not token.isdigit()
     ]
-
-
-def extract_context_tokens(text: str) -> set[str]:
-    return {
-        token
-        for token in tokenize_identity_text(text)
-        if len(token) > 2
-        and token not in NAME_TOKEN_STOPWORDS
-        and token not in CONTEXT_STOPWORDS
-        and token not in GENERIC_PORTRAIT_QUERY_TOKENS
-    }
-
-
-def score_context_families(context_text: str) -> dict[str, int]:
-    context_tokens = extract_context_tokens(context_text)
-    return {
-        family: sum(1 for token in tokens if token in context_tokens)
-        for family, tokens in CONTEXT_FAMILY_KEYWORDS.items()
-    }
-
-
-def infer_context_family(context_text: str) -> str | None:
-    family_scores = score_context_families(context_text)
-    if not family_scores:
-        return None
-    family, score = max(family_scores.items(), key=lambda item: item[1])
-    return family if score > 0 else None
-
-
-def infer_profession_hint(context_text: str) -> str | None:
-    family = infer_context_family(context_text)
-    if family == "acting":
-        return "actor"
-    if family == "music":
-        return "musician"
-    if family == "sports":
-        return "athlete"
-    if family == "politics":
-        return "politician"
-    if family == "science":
-        return "scientist"
-    return None
 
 
 def get_core_name_tokens(person_name: str) -> list[str]:
@@ -1922,20 +1049,6 @@ def title_looks_non_biographical(title: str) -> bool:
     )
 
 
-def page_looks_non_person(title: str, description: str = "") -> bool:
-    title_tokens = set(tokenize_identity_text(title))
-    description_tokens = set(tokenize_identity_text(description))
-    tokens = title_tokens | description_tokens
-    if tokens & NON_PERSON_PAGE_KEYWORDS:
-        return True
-    if "ocean liner" in description.casefold() or "cruise ship" in description.casefold():
-        return True
-    return bool(
-        {"ship", "liner", "vessel", "ferry", "boat", "yacht", "submarine", "aircraft", "plane", "train", "vehicle"}
-        & tokens
-    )
-
-
 def validate_portrait_search_query(person_name: str, portrait_search_query: str) -> str:
     query = sanitize_portrait_search_query(portrait_search_query)
     if not query:
@@ -1952,42 +1065,6 @@ def validate_portrait_search_query(person_name: str, portrait_search_query: str)
             f"portrait_search_query must include the person's name for {person_name}: {query}"
         )
     return query
-
-
-def score_wikipedia_page_result(page: dict, person_name: str, portrait_context: str) -> int:
-    title = str(page.get("title", ""))
-    description = str(page.get("description", ""))
-    combined_tokens = set(tokenize_identity_text(title)) | set(tokenize_identity_text(description))
-    normalized_person_name = normalize_identity_text(person_name)
-    matches_person, matched_count, _, _ = analyze_commons_title_match(title, person_name)
-    context_tokens = extract_context_tokens(portrait_context)
-    context_family = infer_context_family(portrait_context)
-
-    score = 0
-    if page_looks_non_person(title, description):
-        score -= 120
-    if title_looks_non_biographical(title):
-        score -= 100
-    if matches_person:
-        score += 30
-    score += matched_count * 5
-    normalized_title = normalize_identity_text(title)
-    if normalized_title == normalized_person_name:
-        score += 8
-    if normalized_title.startswith(normalized_person_name + " ("):
-        score += 12
-
-    overlap = len(context_tokens & combined_tokens)
-    score += min(overlap, 6) * 4
-
-    if context_family:
-        family_tokens = CONTEXT_FAMILY_KEYWORDS.get(context_family, set())
-        score += len(family_tokens & combined_tokens) * 5
-        mismatch_tokens = PAGE_ROLE_MISMATCH_KEYWORDS.get(context_family, set())
-        if mismatch_tokens:
-            score -= len(mismatch_tokens & combined_tokens) * 8
-
-    return score
 
 
 def normalize_name_key(name: str) -> str:
@@ -2014,6 +1091,33 @@ def validate_fragment_output_rules(fragment: str, person_name: str, label: str) 
         if pattern.search(fragment):
             raise ValueError(
                 f"{label} UI uses unsupported Tailwind class for {person_name}: {pattern.pattern}"
+            )
+    validate_fragment_event_handlers(fragment, person_name, label)
+
+
+def validate_fragment_event_handlers(fragment: str, person_name: str, label: str) -> None:
+    """Walk the parsed HTML tree and reject any on* event-handler attribute whose
+    value is not one of the two known-safe game callbacks:
+      - submitGuess('alive') / submitGuess('dead')
+      - loadNextRound()
+    This prevents XSS via onerror=, onload=, onfocus=, etc. while still allowing
+    the AI to wire up the required game interaction buttons with onclick=.
+    """
+    root = parse_fragment_tree(fragment)
+    for node in iter_fragment_nodes(root):
+        for attr_name, attr_value in node.attrs.items():
+            if not _EVENT_ATTR_RE.match(attr_name):
+                continue
+            # onclick is allowed only for the two known-safe game callbacks.
+            if attr_name.lower() == "onclick":
+                if _SAFE_ONCLICK_RE.match(attr_value):
+                    continue
+                raise ValueError(
+                    f"{label} UI has unsafe onclick handler on <{node.tag}> for {person_name}: {attr_value!r}"
+                )
+            # All other on* attributes are unconditionally blocked.
+            raise ValueError(
+                f"{label} UI has disallowed event-handler attribute '{attr_name}' on <{node.tag}> for {person_name}"
             )
 
 
@@ -2056,112 +1160,17 @@ def validate_guess_button_layout(fragment: str, person_name: str) -> None:
         ancestor = guess_node
         depth = 0
         while ancestor.parent is not None:
-            if depth <= 1 and node_uses_button_overlay_classes(ancestor):
-                logger.warning(
-                    "Guessing UI places guess buttons over the portrait for %s; normalizing to keep the round moving",
-                    person_name,
+            # Check up to 3 ancestor levels (depth 0, 1, 2). Deeper nesting is
+            # considered unlikely to be intentional overlay positioning and is left
+            # undetected to avoid false positives on complex card layouts.
+            if depth <= 2 and node_uses_button_overlay_classes(ancestor):
+                raise ValueError(
+                    f"Guessing UI places guess buttons over the portrait for {person_name}: overlay positioning utilities detected"
                 )
-                return
             ancestor = ancestor.parent
             depth += 1
             if ancestor.tag == "_root":
                 break
-
-
-def iter_node_ancestors(node: FragmentNode):
-    current: FragmentNode | None = node
-    while current is not None:
-        yield current
-        current = current.parent
-
-
-def tailwind_opacity_value(token: str) -> float | None:
-    match = TAILWIND_OPACITY_RE.match(token)
-    if not match:
-        return None
-    return int(match.group(1)) / 100.0
-
-
-def tailwind_scale_factor(token: str) -> float | None:
-    match = TAILWIND_SCALE_RE.match(token)
-    if not match:
-        return None
-    return int(match.group(1)) / 100.0
-
-
-def node_chain_uses_blur(node: FragmentNode) -> bool:
-    for current in iter_node_ancestors(node):
-        for token in split_tailwind_classes(current):
-            if token == "blur" or token.startswith("blur-"):
-                return True
-        style = current.attrs.get("style", "")
-        if INLINE_BLUR_RE.search(style):
-            return True
-    return False
-
-
-def node_chain_lowest_opacity(node: FragmentNode) -> float:
-    lowest = 1.0
-    for current in iter_node_ancestors(node):
-        for token in split_tailwind_classes(current):
-            opacity = tailwind_opacity_value(token)
-            if opacity is not None:
-                lowest = min(lowest, opacity)
-        style = current.attrs.get("style", "")
-        for match in INLINE_OPACITY_RE.finditer(style):
-            try:
-                lowest = min(lowest, float(match.group(1)))
-            except ValueError:
-                continue
-    return lowest
-
-
-def node_chain_largest_scale(node: FragmentNode) -> float:
-    largest = 1.0
-    for current in iter_node_ancestors(node):
-        for token in split_tailwind_classes(current):
-            scale = tailwind_scale_factor(token)
-            if scale is not None:
-                largest = max(largest, scale)
-        style = current.attrs.get("style", "")
-        match = INLINE_SCALE_RE.search(style)
-        if match:
-            try:
-                largest = max(largest, float(match.group(1)))
-            except ValueError:
-                continue
-    return largest
-
-
-def validate_guessing_portrait_presentation(fragment: str, person_name: str) -> None:
-    root = parse_fragment_tree(fragment)
-    portrait_nodes = [
-        node
-        for node in iter_fragment_nodes(root)
-        if node.tag == "img"
-        and node.attrs.get("src", "").strip() == PORTRAIT_IMAGE_PLACEHOLDER
-    ]
-
-    if len(portrait_nodes) != 1:
-        return
-
-    portrait_node = portrait_nodes[0]
-    if node_chain_uses_blur(portrait_node):
-        raise ValueError(
-            f"Guessing portrait presentation is too blurred for {person_name}"
-        )
-
-    lowest_opacity = node_chain_lowest_opacity(portrait_node)
-    if lowest_opacity < GUESSING_PORTRAIT_MIN_OPACITY:
-        raise ValueError(
-            f"Guessing portrait presentation is too faint for {person_name}"
-        )
-
-    largest_scale = node_chain_largest_scale(portrait_node)
-    if largest_scale > GUESSING_PORTRAIT_MAX_SCALE:
-        raise ValueError(
-            f"Guessing portrait presentation is too tightly cropped or zoomed for {person_name}"
-        )
 
 
 def extract_wikimedia_thumbnail_width(image_source: str) -> str | None:
@@ -2180,34 +1189,19 @@ def fetch_json_url(url: str, timeout_seconds: float, user_agent: str) -> dict:
         },
         method="GET",
     )
-    try:
-        wait_for_wikimedia_request_slot(url)
-        with urlopen(request, timeout=timeout_seconds) as response:
-            status = getattr(response, "status", None) or response.getcode()
-            if status and status >= 400:
-                raise RuntimeError(f"HTTP {status}")
-            payload = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raise RuntimeError(f"HTTP Error {exc.code}: {exc.reason}") from exc
+    with urlopen(request, timeout=timeout_seconds) as response:
+        status = getattr(response, "status", None) or response.getcode()
+        if status and status >= 400:
+            raise RuntimeError(f"HTTP {status}")
+        payload = response.read().decode("utf-8")
     return json.loads(payload)
-
-
-def is_rate_limited_error(error: BaseException | str) -> bool:
-    message = str(error)
-    return "429" in message or "Too Many Requests" in message
-
-
-def portrait_retry_backoff_seconds(attempt_index: int) -> float:
-    base_seconds = max(WIKIMEDIA_429_RETRY_BACKOFF_MS, 0.0) / 1000.0
-    return base_seconds * (2 ** attempt_index)
 
 
 def validate_image_url_reachable(image_source: str, person_name: str, label: str) -> None:
     if not IMAGE_URL_VALIDATION_ENABLED:
         return
 
-    with image_url_validation_lock:
-        cached = image_url_validation_cache.get(image_source)
+    cached = image_url_validation_cache.get(image_source)
     if cached is not None:
         ok, reason = cached
         if ok:
@@ -2224,7 +1218,6 @@ def validate_image_url_reachable(image_source: str, person_name: str, label: str
             method=method,
         )
         try:
-            wait_for_wikimedia_request_slot(image_source)
             with urlopen(request, timeout=IMAGE_URL_VALIDATION_TIMEOUT_SECONDS) as response:
                 status = getattr(response, "status", None) or response.getcode()
                 content_type = str(response.headers.get_content_type()).lower()
@@ -2234,14 +1227,12 @@ def validate_image_url_reachable(image_source: str, person_name: str, label: str
                 if not content_type.startswith("image/"):
                     failure_reason = f"{method} returned content type {content_type or 'unknown'}"
                     continue
-                with image_url_validation_lock:
-                    image_url_validation_cache[image_source] = (True, "ok")
+                image_url_validation_cache.set(image_source, (True, "ok"))
                 return
         except Exception as exc:
             failure_reason = f"{method} failed: {exc}"
 
-    with image_url_validation_lock:
-        image_url_validation_cache[image_source] = (False, failure_reason)
+    image_url_validation_cache.set(image_source, (False, failure_reason))
     raise ValueError(
         f"{label} UI image URL did not resolve to a valid image for {person_name}: {image_source} ({failure_reason})"
     )
@@ -2265,6 +1256,10 @@ def validate_portrait_placeholder_usage(
         raise ValueError(
             f"{label} UI contains too many portrait images for {person_name}"
         )
+    if placeholder_occurrences != len(image_sources):
+        raise ValueError(
+            f"{label} UI must use the portrait placeholder only inside <img src> attributes for {person_name}"
+        )
 
     for image_source in image_sources:
         if image_source != PORTRAIT_IMAGE_PLACEHOLDER:
@@ -2275,32 +1270,13 @@ def validate_portrait_placeholder_usage(
     return image_sources
 
 
-def strip_stray_portrait_placeholder(fragment: str) -> str:
-    return fragment.replace(PORTRAIT_IMAGE_PLACEHOLDER, "")
-
-
-def build_portrait_search_candidates(
-    person_name: str,
-    portrait_search_query: str,
-    portrait_context: str = "",
-) -> list[str]:
-    profession_hint = infer_profession_hint(portrait_context)
-    candidates = []
-    if profession_hint:
-        candidates.extend(
-            [
-                f"{person_name} {profession_hint} portrait",
-                f"{person_name} {profession_hint} publicity photo",
-            ]
-        )
-    candidates.extend(
-        [
-            portrait_search_query,
-            f"{person_name} portrait",
-            f"{person_name} headshot",
-            f"{person_name} publicity portrait",
-        ]
-    )
+def build_portrait_search_candidates(person_name: str, portrait_search_query: str) -> list[str]:
+    candidates = [
+        portrait_search_query,
+        f"{person_name} portrait",
+        f"{person_name} headshot",
+        f"{person_name} publicity portrait",
+    ]
     deduped: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -2383,270 +1359,32 @@ def get_wikipedia_page_summary(page_key: str) -> dict:
     )
 
 
-def get_wikipedia_page_metadata(page_title: str) -> dict:
-    params = {
-        "action": "query",
-        "format": "json",
-        "redirects": "1",
-        "titles": page_title,
-        "prop": "pageprops|categories",
-        "cllimit": "max",
-    }
-    data = fetch_json_url(
-        f"{WIKIPEDIA_ACTION_API_URL}?{urlencode(params)}",
-        timeout_seconds=WIKIMEDIA_SEARCH_TIMEOUT_SECONDS,
-        user_agent=WIKIMEDIA_API_USER_AGENT,
-    )
-    pages = data.get("query", {}).get("pages", {})
-    if isinstance(pages, dict):
-        for page in pages.values():
-            if isinstance(page, dict):
-                return page
-    return {}
-
-
-def get_wikidata_entity(entity_id: str) -> dict:
-    encoded_id = quote(entity_id, safe="")
-    return fetch_json_url(
-        f"{WIKIDATA_ENTITY_DATA_URL}{encoded_id}.json",
-        timeout_seconds=WIKIMEDIA_SEARCH_TIMEOUT_SECONDS,
-        user_agent=WIKIMEDIA_API_USER_AGENT,
-    )
-
-
-def infer_status_from_wikipedia_categories(page_data: dict) -> str | None:
-    categories = page_data.get("categories") or []
-    category_titles = [
-        str(category.get("title", ""))
-        for category in categories
-        if isinstance(category, dict)
-    ]
-    lowered_titles = [title.casefold() for title in category_titles]
-    if any(title.endswith("living people") for title in lowered_titles):
-        return "alive"
-    if any(re.search(r"category:\d{4} deaths$", title) for title in lowered_titles):
-        return "dead"
-    return None
-
-
-def infer_status_from_wikidata_entity(entity_data: dict) -> str | None:
-    entities = entity_data.get("entities", {})
-    if not isinstance(entities, dict):
-        return None
-    for entity in entities.values():
-        if not isinstance(entity, dict):
-            continue
-        claims = entity.get("claims", {})
-        if not isinstance(claims, dict):
-            continue
-        if claims.get("P570"):
-            return "dead"
-    return None
-
-
-def infer_status_from_summary(summary: dict) -> str | None:
-    extract = " ".join(str(summary.get("extract", "")).split())
-    if not extract:
-        return None
-    prefix = extract[:240].casefold()
-    if " was " in prefix and "(born" not in prefix:
-        return "dead"
-    if " is " in prefix:
-        return "alive"
-    return None
-
-
-def extract_biographical_years(text: str) -> tuple[int | None, int | None]:
-    normalized = " ".join(str(text or "").split())
-    if not normalized:
-        return None, None
-
-    lifespan_match = re.search(
-        r"\((?:c\.\s*)?(?P<birth>\d{4})\s*[–-]\s*(?P<death>\d{4})\)",
-        normalized,
-    )
-    if lifespan_match:
-        return int(lifespan_match.group("birth")), int(lifespan_match.group("death"))
-
-    born_match = re.search(
-        r"\((?:born|b\.)[^)]*?(?P<birth>\d{4})\)",
-        normalized,
-        re.IGNORECASE,
-    )
-    if born_match:
-        return int(born_match.group("birth")), None
-
-    born_text_match = re.search(
-        r"\bborn\b[^.]{0,80}?(?P<birth>\d{4})",
-        normalized,
-        re.IGNORECASE,
-    )
-    if born_text_match:
-        return int(born_text_match.group("birth")), None
-
-    return None, None
-
-
-def birth_year_is_plausible_for_game(birth_year: int) -> bool:
-    return PLAUSIBLE_CANDIDATE_MIN_BIRTH_YEAR <= birth_year <= PLAUSIBLE_CANDIDATE_MAX_BIRTH_YEAR
-
-
-def resolve_candidate_age_plausibility(person_name: str) -> bool | None:
+def resolve_wikipedia_person_summary(person_name: str) -> tuple[dict, str] | None:
     cache_key = normalize_name_key(person_name)
-    with candidate_plausibility_lock:
-        if cache_key in candidate_plausibility_cache:
-            return candidate_plausibility_cache[cache_key]
+    cached = wikipedia_person_summary_cache.get(cache_key)
+    if cached is not None:
+        ok, value = cached
+        if ok and isinstance(value, dict):
+            return value["summary"], value["title"]
+        return None
 
-    plausible: bool | None = None
-    try:
-        ranked_pages = sorted(
-            search_wikipedia_pages(person_name),
-            key=lambda page: (
-                -score_wikipedia_page_result(page, person_name, ""),
-                -len(str(page.get("description", ""))),
-            ),
-        )
-        for page in ranked_pages:
-            title = str(page.get("title", "")).strip()
-            description = str(page.get("description", "")).strip()
-            if not title or title_looks_non_biographical(title):
-                continue
-            if page_looks_non_person(title, description):
-                continue
-            matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
-            if not matches_person and not normalize_identity_text(title).startswith(
-                normalize_identity_text(person_name)
-            ):
-                continue
-
-            birth_year, _ = extract_biographical_years(description or title)
-            if birth_year is None:
-                page_key = str(page.get("key", "")).strip()
-                if page_key:
-                    try:
-                        summary = get_wikipedia_page_summary(page_key)
-                    except Exception:
-                        summary = {}
-                    summary_title = str(summary.get("title", "")).strip()
-                    summary_description = str(
-                        summary.get("description")
-                        or summary.get("extract")
-                        or ""
-                    ).strip()
-                    if page_looks_non_person(summary_title or title, summary_description):
-                        continue
-                    birth_year, _ = extract_biographical_years(summary_description)
-
-            if birth_year is not None:
-                plausible = birth_year_is_plausible_for_game(birth_year)
-                break
-    except Exception as exc:
-        logger.warning("Candidate plausibility check failed for %s: %s", person_name, exc)
-
-    with candidate_plausibility_lock:
-        candidate_plausibility_cache[cache_key] = plausible
-    return plausible
-
-
-def resolve_person_actual_status(person_name: str) -> str | None:
-    cache_key = normalize_name_key(person_name)
-    with status_resolution_lock:
-        if cache_key in status_resolution_cache:
-            return status_resolution_cache[cache_key]
-
-    resolved_status: str | None = None
-    try:
-        ranked_pages = sorted(
-            search_wikipedia_pages(person_name),
-            key=lambda page: (
-                -score_wikipedia_page_result(page, person_name, ""),
-                -len(str(page.get("description", ""))),
-            ),
-        )
-        for page in ranked_pages:
-            title = str(page.get("title", "")).strip()
-            description = str(page.get("description", "")).strip()
-            if not title or title_looks_non_biographical(title):
-                continue
-            if page_looks_non_person(title, description):
-                continue
-            matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
-            if not matches_person and not normalize_identity_text(title).startswith(
-                normalize_identity_text(person_name)
-            ):
-                continue
-
-            page_data = get_wikipedia_page_metadata(title)
-            resolved_status = infer_status_from_wikipedia_categories(page_data)
-            if resolved_status:
-                break
-
-            pageprops = page_data.get("pageprops") or {}
-            wikibase_item = str(pageprops.get("wikibase_item", "")).strip()
-            if wikibase_item:
-                try:
-                    entity_data = get_wikidata_entity(wikibase_item)
-                except Exception:
-                    entity_data = {}
-                resolved_status = infer_status_from_wikidata_entity(entity_data)
-                if resolved_status:
-                    break
-
-            page_key = str(page.get("key", "")).strip()
-            if page_key:
-                try:
-                    summary = get_wikipedia_page_summary(page_key)
-                except Exception:
-                    summary = {}
-                resolved_status = infer_status_from_summary(summary)
-                if resolved_status:
-                    break
-    except Exception as exc:
-        logger.warning("Status verification failed for %s: %s", person_name, exc)
-
-    with status_resolution_lock:
-        status_resolution_cache[cache_key] = resolved_status
-    return resolved_status
-
-
-def resolve_wikipedia_page_portrait_url(
-    person_name: str,
-    portrait_search_query: str,
-    portrait_context: str = "",
-) -> tuple[str, str] | None:
-    profession_hint = infer_profession_hint(portrait_context)
-    search_terms = [portrait_search_query]
-    if profession_hint:
-        search_terms.append(f"{person_name} {profession_hint}")
-    search_terms.append(person_name)
-
-    pages_by_key: dict[str, dict] = {}
-    for search_term in search_terms:
-        for page in search_wikipedia_pages(search_term):
-            key = str(page.get("key", "")).strip() or str(page.get("title", "")).strip()
-            if not key:
-                continue
-            pages_by_key.setdefault(key, page)
-
+    pages = search_wikipedia_pages(person_name)
+    normalized_person_name = normalize_identity_text(person_name)
     ranked_pages = sorted(
-        pages_by_key.values(),
+        pages,
         key=lambda page: (
-            -score_wikipedia_page_result(page, person_name, portrait_context),
+            normalize_identity_text(str(page.get("title", ""))) != normalized_person_name,
+            title_looks_non_biographical(str(page.get("title", ""))),
             -len(str(page.get("description", ""))),
         ),
     )
 
     for page in ranked_pages:
         title = str(page.get("title", ""))
-        description = str(page.get("description", ""))
         if title_looks_non_biographical(title):
             continue
-        if page_looks_non_person(title, description):
-            continue
         matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
-        if not matches_person and not normalize_identity_text(title).startswith(
-            normalize_identity_text(person_name)
-        ):
+        if not matches_person and normalize_identity_text(title) != normalized_person_name:
             continue
         page_key = str(page.get("key", "")).strip()
         if not page_key:
@@ -2655,258 +1393,310 @@ def resolve_wikipedia_page_portrait_url(
             summary = get_wikipedia_page_summary(page_key)
         except Exception:
             continue
-        summary_title = str(summary.get("title", ""))
-        summary_description = str(
-            summary.get("description")
-            or summary.get("extract")
-            or ""
-        )
-        if page_looks_non_person(summary_title or title, summary_description):
+        if str(summary.get("type", "")).casefold() == "disambiguation":
             continue
-        thumbnail = summary.get("thumbnail") or {}
-        image_source = strip_url_query_and_fragment(str(thumbnail.get("source", "")).strip())
-        if not image_source:
-            continue
-        lowered = image_source.casefold()
-        if lowered.startswith("//"):
-            image_source = f"https:{image_source}"
-            lowered = image_source.casefold()
-        if not lowered.startswith(REMOTE_IMAGE_PREFIXES):
-            continue
-        if any(marker in lowered for marker in WIKIMEDIA_DOMAIN_MARKERS):
-            if not any(lowered.startswith(prefix) for prefix in WIKIMEDIA_THUMB_PREFIXES):
-                continue
-            width = extract_wikimedia_thumbnail_width(image_source)
-            if width not in VALID_WIKIMEDIA_THUMB_WIDTHS:
-                continue
-        if not url_has_supported_raster_extension(image_source):
-            continue
-        return image_source, title
+        resolved_title = str(summary.get("title") or title)
+        payload = {"summary": summary, "title": resolved_title}
+        wikipedia_person_summary_cache.set(cache_key, (True, payload))
+        return summary, resolved_title
 
+    wikipedia_person_summary_cache.set(
+        cache_key,
+        (False, f"No matching Wikipedia person page found for {person_name}"),
+    )
     return None
 
 
-def resolve_wikimedia_portrait_url(
-    person_name: str,
-    portrait_search_query: str,
-    portrait_context: str = "",
-) -> str:
-    profession_hint = (infer_profession_hint(portrait_context) or "").casefold()
-    cache_key = (person_name.casefold(), portrait_search_query.casefold(), profession_hint)
-    with portrait_resolution_lock:
-        cached = portrait_resolution_cache.get(cache_key)
+def get_wikidata_entity(entity_id: str) -> dict:
+    normalized_entity_id = entity_id.strip().upper()
+    if not re.fullmatch(r"Q\d+", normalized_entity_id):
+        raise ValueError(f"Invalid Wikidata entity id: {entity_id}")
+
+    cached = wikidata_entity_cache.get(normalized_entity_id)
     if cached is not None:
         ok, value = cached
-        cache_invalidated = False
+        if ok and isinstance(value, dict):
+            return value
+        raise ValueError(str(value))
+
+    data = fetch_json_url(
+        WIKIDATA_ENTITY_DATA_URL_TEMPLATE.format(entity_id=normalized_entity_id),
+        timeout_seconds=WIKIMEDIA_SEARCH_TIMEOUT_SECONDS,
+        user_agent=WIKIMEDIA_API_USER_AGENT,
+    )
+    entity = data.get("entities", {}).get(normalized_entity_id)
+    if not isinstance(entity, dict):
+        error = f"Wikidata entity not found: {normalized_entity_id}"
+        wikidata_entity_cache.set(normalized_entity_id, (False, error))
+        raise ValueError(error)
+
+    wikidata_entity_cache.set(normalized_entity_id, (True, entity))
+    return entity
+
+
+def iter_wikidata_claims(entity: dict, property_id: str) -> list[dict]:
+    claims = entity.get("claims", {}).get(property_id, [])
+    if isinstance(claims, list):
+        return [claim for claim in claims if isinstance(claim, dict)]
+    return []
+
+
+def wikidata_claim_has_value(entity: dict, property_id: str) -> bool:
+    for claim in iter_wikidata_claims(entity, property_id):
+        if claim.get("rank") == "deprecated":
+            continue
+        mainsnak = claim.get("mainsnak") or {}
+        snaktype = mainsnak.get("snaktype")
+        if snaktype in {"value", "somevalue"}:
+            return True
+    return False
+
+
+def wikidata_claim_has_entity_value(entity: dict, property_id: str, entity_id: str) -> bool:
+    expected_id = entity_id.strip().upper()
+    for claim in iter_wikidata_claims(entity, property_id):
+        if claim.get("rank") == "deprecated":
+            continue
+        mainsnak = claim.get("mainsnak") or {}
+        datavalue = mainsnak.get("datavalue") or {}
+        value = datavalue.get("value") or {}
+        if isinstance(value, dict) and str(value.get("id", "")).upper() == expected_id:
+            return True
+    return False
+
+
+def verify_actual_status(person_name: str) -> str:
+    cache_key = normalize_name_key(person_name)
+    cached = status_verification_cache.get(cache_key)
+    if cached is not None:
+        ok, value = cached
         if ok:
-            if is_local_portrait_fallback_url(str(value)):
-                logger.info(
-                    "Evicting cached local portrait fallback for %s so real portrait resolution can retry",
-                    person_name,
-                )
-                forget_portrait_resolution(cache_key)
-                cache_invalidated = True
-            elif str(value).lower().startswith(("http://", "https://")):
-                try:
-                    validate_image_url_reachable(value, person_name, "Cached portrait")
-                except Exception as exc:
-                    logger.warning(
-                        "Evicting stale cached portrait URL for %s: %s",
-                        person_name,
-                        exc,
-                    )
-                    forget_portrait_resolution(cache_key)
-                    cache_invalidated = True
-                else:
-                    return value
-            else:
-                forget_portrait_resolution(cache_key)
-                cache_invalidated = True
-        if not cache_invalidated:
-            raise ValueError(value)
+            return value
+        raise ValueError(value)
+
+    started_at = perf_now()
+    try:
+        summary_result = resolve_wikipedia_person_summary(person_name)
+        if summary_result is None:
+            raise ValueError(f"No matching Wikipedia person page found for {person_name}")
+        summary, resolved_title = summary_result
+        entity_id = str(summary.get("wikibase_item", "")).strip()
+        if not entity_id:
+            raise ValueError(f"Wikipedia summary has no Wikidata entity for {person_name}")
+
+        entity = get_wikidata_entity(entity_id)
+        if not wikidata_claim_has_entity_value(
+            entity,
+            WIKIDATA_INSTANCE_OF_PROPERTY,
+            WIKIDATA_HUMAN_ENTITY_ID,
+        ):
+            raise ValueError(f"Wikidata entity {entity_id} is not marked as a human")
+
+        actual_status = (
+            "dead"
+            if wikidata_claim_has_value(entity, WIKIDATA_DATE_OF_DEATH_PROPERTY)
+            else "alive"
+        )
+        status_verification_cache.set(cache_key, (True, actual_status))
+        append_gemini_audit_log(
+            "status.verify",
+            status="accepted",
+            person_name=person_name,
+            verified_actual_status=actual_status,
+            wikipedia_title=resolved_title,
+            wikidata_entity_id=entity_id,
+        )
+        log_perf(
+            "status.verify",
+            started_at,
+            person_name=person_name,
+            verified_actual_status=actual_status,
+            wikidata_entity_id=entity_id,
+        )
+        return actual_status
+    except Exception as exc:
+        error = f"Status verification failed for {person_name}: {exc}"
+        append_gemini_audit_log(
+            "status.verify",
+            status="rejected",
+            person_name=person_name,
+            error=error,
+        )
+        raise ValueError(error) from exc
+
+
+def determine_actual_status(person_name: str, model_actual_status: str | None) -> str:
+    if not STATUS_VERIFICATION_ENABLED:
+        if model_actual_status:
+            return model_actual_status
+        raise ValueError(
+            f"No model actual_status supplied for {person_name} and status verification is disabled"
+        )
+
+    try:
+        verified_actual_status = verify_actual_status(person_name)
+    except Exception:
+        if STATUS_VERIFICATION_REQUIRED or not model_actual_status:
+            raise
+        return model_actual_status
+
+    if model_actual_status and model_actual_status != verified_actual_status:
+        append_gemini_audit_log(
+            "status.model_mismatch",
+            status="corrected",
+            person_name=person_name,
+            model_actual_status=model_actual_status,
+            verified_actual_status=verified_actual_status,
+        )
+    return verified_actual_status
+
+
+def resolve_wikipedia_page_portrait_url(person_name: str) -> tuple[str, str] | None:
+    summary_result = resolve_wikipedia_person_summary(person_name)
+    if summary_result is None:
+        return None
+
+    summary, resolved_title = summary_result
+    thumbnail = summary.get("thumbnail") or {}
+    image_source = strip_url_query_and_fragment(str(thumbnail.get("source", "")).strip())
+    if not image_source:
+        return None
+    lowered = image_source.casefold()
+    if lowered.startswith("//"):
+        image_source = f"https:{image_source}"
+        lowered = image_source.casefold()
+    if not lowered.startswith(REMOTE_IMAGE_PREFIXES):
+        return None
+    if any(marker in lowered for marker in WIKIMEDIA_DOMAIN_MARKERS):
+        if not any(lowered.startswith(prefix) for prefix in WIKIMEDIA_THUMB_PREFIXES):
+            return None
+        width = extract_wikimedia_thumbnail_width(image_source)
+        if width not in VALID_WIKIMEDIA_THUMB_WIDTHS:
+            return None
+    if not url_has_supported_raster_extension(image_source):
+        return None
+    return image_source, resolved_title
+
+
+
+def resolve_wikimedia_portrait_url(person_name: str, portrait_search_query: str) -> str:
+    cache_key = (person_name.casefold(), portrait_search_query.casefold())
+    cached = portrait_resolution_cache.get(cache_key)
+    if cached is not None:
+        ok, value = cached
+        if ok:
+            return value
+        raise ValueError(value)
 
     search_query = validate_portrait_search_query(person_name, portrait_search_query)
     started_at = perf_now()
-    max_attempts = 1 if PORTRAIT_FALLBACK_MODE == "fast" else max(
-        WIKIMEDIA_429_RETRY_COUNT + 1,
-        1,
-    )
-    last_rate_limit_error: str | None = None
-    attempted_queries_for_log: list[str] = []
+    attempted_queries: list[str] = []
+    tried_urls: set[str] = set()
     resolution_error = (
         f"No valid Wikimedia portrait found for {person_name} using portrait_search_query '{search_query}'"
     )
 
-    for rate_limit_attempt in range(max_attempts):
-        attempted_queries: list[str] = []
-        tried_urls: set[str] = set()
-        try:
-            wikipedia_page_result = resolve_wikipedia_page_portrait_url(
-                person_name,
-                search_query,
-                portrait_context,
+    try:
+        wikipedia_page_result = resolve_wikipedia_page_portrait_url(person_name)
+        if wikipedia_page_result is not None:
+            image_source, resolved_title = wikipedia_page_result
+            validate_image_url_reachable(image_source, person_name, "Resolved portrait")
+            portrait_resolution_cache.set(cache_key, (True, image_source))
+            append_gemini_audit_log(
+                "portrait.resolve",
+                status="accepted",
+                person_name=person_name,
+                portrait_search_query=search_query,
+                attempted_queries=["wikipedia_page_exact_or_search"],
+                resolved_portrait_url=image_source,
+                resolved_from_query="wikipedia_page_exact_or_search",
+                resolved_title=resolved_title,
             )
-            if wikipedia_page_result is not None:
-                image_source, resolved_title = wikipedia_page_result
-                validate_image_url_reachable(image_source, person_name, "Resolved portrait")
-                remember_successful_portrait_resolution(cache_key, image_source)
+            log_perf(
+                "portrait.resolve",
+                started_at,
+                person_name=person_name,
+                portrait_search_query=search_query,
+                resolved_from_query="wikipedia_page_exact_or_search",
+            )
+            return image_source
+
+        for candidate_query in build_portrait_search_candidates(person_name, search_query):
+            attempted_queries.append(candidate_query)
+            pages = search_wikimedia_commons_candidates(candidate_query)
+            ranked_pages = sorted(
+                pages,
+                key=lambda page: (
+                    -score_commons_candidate_title(str(page.get("title", "")), person_name),
+                    page.get("index", 10_000),
+                ),
+            )
+            for page in ranked_pages:
+                title = str(page.get("title", ""))
+                matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
+                if not matches_person:
+                    continue
+                if commons_title_looks_non_photographic(title):
+                    continue
+                imageinfo = page.get("imageinfo") or []
+                if not imageinfo:
+                    continue
+                image_meta = imageinfo[0]
+                image_source = strip_url_query_and_fragment(str(image_meta.get("thumburl", "")).strip())
+                if not image_source or image_source in tried_urls:
+                    continue
+                tried_urls.add(image_source)
+                lowered = image_source.casefold()
+                if not any(lowered.startswith(prefix) for prefix in WIKIMEDIA_THUMB_PREFIXES):
+                    continue
+                width = extract_wikimedia_thumbnail_width(image_source)
+                if width not in VALID_WIKIMEDIA_THUMB_WIDTHS:
+                    continue
+                if not url_has_supported_raster_extension(image_source):
+                    continue
+                thumb_mime = str(
+                    image_meta.get("thumbmime") or image_meta.get("mime") or ""
+                ).casefold()
+                if thumb_mime and not thumb_mime.startswith("image/"):
+                    continue
+                try:
+                    validate_image_url_reachable(image_source, person_name, "Resolved portrait")
+                except Exception:
+                    continue
+
+                portrait_resolution_cache.set(cache_key, (True, image_source))
                 append_gemini_audit_log(
                     "portrait.resolve",
                     status="accepted",
                     person_name=person_name,
                     portrait_search_query=search_query,
-                    attempted_queries=["wikipedia_page_exact_or_search"],
+                    attempted_queries=attempted_queries,
                     resolved_portrait_url=image_source,
-                    resolved_from_query="wikipedia_page_exact_or_search",
-                    resolved_title=resolved_title,
+                    resolved_from_query=candidate_query,
+                    resolved_title=title,
                 )
                 log_perf(
                     "portrait.resolve",
                     started_at,
                     person_name=person_name,
                     portrait_search_query=search_query,
-                    resolved_from_query="wikipedia_page_exact_or_search",
+                    resolved_from_query=candidate_query,
                 )
                 return image_source
-
-            for candidate_query in build_portrait_search_candidates(
-                person_name,
-                search_query,
-                portrait_context,
-            ):
-                attempted_queries.append(candidate_query)
-                pages = search_wikimedia_commons_candidates(candidate_query)
-                ranked_pages = sorted(
-                    pages,
-                    key=lambda page: (
-                        -score_commons_candidate_title(str(page.get("title", "")), person_name),
-                        page.get("index", 10_000),
-                    ),
-                )
-                for page in ranked_pages:
-                    title = str(page.get("title", ""))
-                    matches_person, _, _, _ = analyze_commons_title_match(title, person_name)
-                    if not matches_person:
-                        continue
-                    if commons_title_looks_non_photographic(title):
-                        continue
-                    imageinfo = page.get("imageinfo") or []
-                    if not imageinfo:
-                        continue
-                    image_meta = imageinfo[0]
-                    image_source = strip_url_query_and_fragment(
-                        str(image_meta.get("thumburl", "")).strip()
-                    )
-                    if not image_source or image_source in tried_urls:
-                        continue
-                    tried_urls.add(image_source)
-                    lowered = image_source.casefold()
-                    if not any(lowered.startswith(prefix) for prefix in WIKIMEDIA_THUMB_PREFIXES):
-                        continue
-                    width = extract_wikimedia_thumbnail_width(image_source)
-                    if width not in VALID_WIKIMEDIA_THUMB_WIDTHS:
-                        continue
-                    if not url_has_supported_raster_extension(image_source):
-                        continue
-                    thumb_mime = str(
-                        image_meta.get("thumbmime") or image_meta.get("mime") or ""
-                    ).casefold()
-                    if thumb_mime and not thumb_mime.startswith("image/"):
-                        continue
-                    original_mime = str(image_meta.get("mime") or "").casefold()
-                    if original_mime == "image/svg+xml":
-                        continue
-                    try:
-                        validate_image_url_reachable(
-                            image_source,
-                            person_name,
-                            "Resolved portrait",
-                        )
-                    except Exception as exc:
-                        if is_rate_limited_error(exc):
-                            raise
-                        continue
-
-                    remember_successful_portrait_resolution(cache_key, image_source)
-                    append_gemini_audit_log(
-                        "portrait.resolve",
-                        status="accepted",
-                        person_name=person_name,
-                        portrait_search_query=search_query,
-                        attempted_queries=attempted_queries,
-                        resolved_portrait_url=image_source,
-                        resolved_from_query=candidate_query,
-                        resolved_title=title,
-                    )
-                    log_perf(
-                        "portrait.resolve",
-                        started_at,
-                        person_name=person_name,
-                        portrait_search_query=search_query,
-                        resolved_from_query=candidate_query,
-                    )
-                    return image_source
-        except Exception as exc:
-            attempted_queries_for_log = attempted_queries or attempted_queries_for_log
-            if is_rate_limited_error(exc):
-                last_rate_limit_error = f"portrait_search_query resolution failed for {person_name}: {exc}"
-                if rate_limit_attempt + 1 < max_attempts:
-                    backoff_seconds = portrait_retry_backoff_seconds(rate_limit_attempt)
-                    logger.warning(
-                        "Wikimedia portrait resolution rate-limited for %s; retrying in %.2fs (%s/%s): %s",
-                        person_name,
-                        backoff_seconds,
-                        rate_limit_attempt + 1,
-                        max_attempts,
-                        exc,
-                    )
-                    if backoff_seconds > 0:
-                        time.sleep(backoff_seconds)
-                    continue
-                resolution_error = last_rate_limit_error
-                break
-
-            resolution_error = (
-                f"{resolution_error} ({exc})"
-                if attempted_queries
-                else f"portrait_search_query resolution failed for {person_name}: {exc}"
-            )
-            break
-        else:
-            if attempted_queries:
-                attempted_queries_for_log = attempted_queries
-            resolution_error = (
-                f"No valid Wikimedia portrait found for {person_name} using portrait_search_query '{search_query}'"
-            )
-            break
-
-    if last_rate_limit_error is not None and PORTRAIT_FALLBACK_MODE != "require_real":
-        fallback_url = build_local_portrait_fallback_url(person_name)
-        append_gemini_audit_log(
-            "portrait.resolve",
-            status="accepted_fallback",
-            person_name=person_name,
-            portrait_search_query=search_query,
-            attempted_queries=attempted_queries_for_log,
-            resolved_portrait_url=fallback_url,
-            resolved_from_query="local_avatar_fallback",
-            error=last_rate_limit_error,
+    except Exception as exc:
+        resolution_error = (
+            f"{resolution_error} ({exc})"
+            if attempted_queries
+            else f"portrait_search_query resolution failed for {person_name}: {exc}"
         )
-        logger.warning(
-            "Using local avatar fallback for %s after Wikimedia throttling: %s",
-            person_name,
-            last_rate_limit_error,
-        )
-        return fallback_url
 
-    with portrait_resolution_lock:
-        portrait_resolution_cache[cache_key] = (False, resolution_error)
+    portrait_resolution_cache.set(cache_key, (False, resolution_error))
     append_gemini_audit_log(
         "portrait.resolve",
         status="rejected",
         person_name=person_name,
         portrait_search_query=search_query,
-        attempted_queries=attempted_queries_for_log,
+        attempted_queries=attempted_queries,
         error=resolution_error,
     )
     raise ValueError(resolution_error)
@@ -2914,17 +1704,6 @@ def resolve_wikimedia_portrait_url(
 
 def inject_portrait_url(fragment: str, portrait_url: str) -> str:
     return fragment.replace(PORTRAIT_IMAGE_PLACEHOLDER, portrait_url)
-
-
-def build_local_portrait_fallback_url(person_name: str) -> str:
-    return f"{app_path('/portrait-fallback')}?name={quote(person_name)}"
-
-
-def is_local_portrait_fallback_url(image_source: str) -> bool:
-    parsed = urlsplit(image_source)
-    if parsed.scheme or parsed.netloc:
-        return False
-    return parsed.path == app_path("/portrait-fallback")
 
 
 def validate_embedded_image_urls(
@@ -2947,8 +1726,6 @@ def validate_embedded_image_urls(
             raise ValueError(
                 f"{label} UI still contains the portrait placeholder for {person_name}"
             )
-        if is_local_portrait_fallback_url(image_source):
-            continue
         lowered_image_source = image_source.lower()
         if not lowered_image_source.startswith(REMOTE_IMAGE_PREFIXES):
             raise ValueError(
@@ -2980,8 +1757,8 @@ def normalize_round(
         person_name,
         round_item.portrait_search_query,
     )
-    guessing_ui_html = normalize_generated_html_fragment(round_item.guessing_ui_html)
-    reveal_ui_html = normalize_generated_html_fragment(round_item.reveal_ui_html)
+    guessing_ui_html = round_item.guessing_ui_html.strip()
+    reveal_ui_html = round_item.reveal_ui_html.strip()
 
     if key in forbidden_keys:
         raise ValueError(f"Model returned forbidden person: {person_name}")
@@ -2993,13 +1770,15 @@ def normalize_round(
         raise ValueError(
             f"Model changed locked status for {person_name} from {locked_actual_status} to {round_item.actual_status}"
         )
+    verified_actual_status = determine_actual_status(person_name, round_item.actual_status)
+    if round_item.actual_status != verified_actual_status:
+        raise ValueError(
+            f"Model returned incorrect status for {person_name}: {round_item.actual_status}; verified status is {verified_actual_status}"
+        )
     if not GUESS_ALIVE_RE.search(guessing_ui_html) or not GUESS_DEAD_RE.search(guessing_ui_html):
         raise ValueError(f"Guessing UI is missing guess buttons for {person_name}")
     if not NEXT_ROUND_RE.search(reveal_ui_html):
         raise ValueError(f"Reveal UI is missing next-round button for {person_name}")
-    guessing_ui_html = ensure_guess_buttons_clickable(guessing_ui_html)
-    reveal_ui_html = normalize_reveal_status_tense(reveal_ui_html)
-    reveal_ui_html = ensure_next_round_button_clickable(reveal_ui_html)
     validate_fragment_output_rules(guessing_ui_html, person_name, "Guessing")
     validate_fragment_output_rules(reveal_ui_html, person_name, "Reveal")
     validate_status_neutral_guessing_copy(guessing_ui_html, person_name)
@@ -3017,38 +1796,16 @@ def normalize_round(
         "Reveal",
         maximum_count=1,
     )
-    portrait_context = extract_visible_text(guessing_ui_html)
-    portrait_url = resolve_wikimedia_portrait_url(
-        person_name,
-        portrait_search_query,
-        portrait_context,
-    )
+
+    portrait_url = resolve_wikimedia_portrait_url(person_name, portrait_search_query)
     guessing_ui_html = inject_portrait_url(guessing_ui_html, portrait_url)
     reveal_ui_html = inject_portrait_url(reveal_ui_html, portrait_url)
-    guessing_ui_html = strip_stray_portrait_placeholder(guessing_ui_html)
-    reveal_ui_html = strip_stray_portrait_placeholder(reveal_ui_html)
-    reveal_ui_html = humanize_reveal_dates(
-        reveal_ui_html,
-        round_item.date_of_birth,
-        round_item.date_of_death,
-    )
-    next_round_label = sanitize_next_round_label(round_item.next_round_label)
-    reveal_ui_html = rewrite_next_round_control(
-        reveal_ui_html,
-        next_round_label,
-        hide_on_mobile=True,
-    )
-    guessing_ui_html = wrap_round_fragment(guessing_ui_html)
-    reveal_ui_html = wrap_round_fragment(reveal_ui_html)
     validate_embedded_image_urls(guessing_ui_html, person_name, "Guessing", require_image=True)
     validate_embedded_image_urls(reveal_ui_html, person_name, "Reveal")
 
     return {
         "person_name": person_name,
-        "actual_status": round_item.actual_status,
-        "date_of_birth": round_item.date_of_birth,
-        "date_of_death": round_item.date_of_death,
-        "next_round_label": next_round_label,
+        "actual_status": verified_actual_status,
         "guessing_ui_html": guessing_ui_html,
         "reveal_ui_html": reveal_ui_html,
     }
@@ -3075,10 +1832,10 @@ def generate_with_modern_sdk(
             model=model_name,
             contents=prompt,
             config=modern_types.GenerateContentConfig(
-                temperature=ROUND_UI_TEMPERATURE,
-                topP=ROUND_UI_TOP_P,
+                temperature=GENERATION_TEMPERATURE,
+                topP=GENERATION_TOP_P,
                 candidateCount=1,
-                maxOutputTokens=ROUND_UI_MAX_OUTPUT_TOKENS,
+                maxOutputTokens=GENERATION_MAX_OUTPUT_TOKENS,
                 responseMimeType="application/json",
                 responseJsonSchema=GeneratedRound.model_json_schema(),
                 automaticFunctionCalling=modern_types.AutomaticFunctionCallingConfig(
@@ -3114,15 +1871,7 @@ def generate_with_modern_sdk(
     if not response_text:
         raise RuntimeError(f"{model_name} returned an empty response")
 
-    try:
-        round_item = GeneratedRound.model_validate_json(response_text)
-    except Exception:
-        payload = extract_json(response_text)
-        if payload is None:
-            raise
-        if isinstance(payload, list):
-            payload = payload[0]
-        round_item = GeneratedRound.model_validate(payload)
+    round_item = GeneratedRound.model_validate_json(response_text)
     log_perf(
         "genai.generate",
         started_at,
@@ -3155,11 +1904,12 @@ def select_candidates_with_modern_sdk(
             model=model_name,
             contents=prompt,
             config=modern_types.GenerateContentConfig(
-                temperature=CANDIDATE_SELECTION_TEMPERATURE,
-                topP=CANDIDATE_SELECTION_TOP_P,
+                temperature=GENERATION_TEMPERATURE,
+                topP=GENERATION_TOP_P,
                 candidateCount=1,
                 maxOutputTokens=CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS,
                 responseMimeType="application/json",
+                responseJsonSchema=CandidateSelection.model_json_schema(),
                 automaticFunctionCalling=modern_types.AutomaticFunctionCallingConfig(
                     disable=True,
                 ),
@@ -3193,13 +1943,7 @@ def select_candidates_with_modern_sdk(
     if not response_text:
         raise RuntimeError(f"{model_name} returned an empty candidate-selection response")
 
-    try:
-        selection = CandidateSelection.model_validate_json(response_text)
-    except Exception:
-        payload = extract_json(response_text)
-        if payload is None:
-            raise
-        selection = CandidateSelection.model_validate(payload)
+    selection = CandidateSelection.model_validate_json(response_text)
     log_perf(
         "genai.candidate_selection",
         started_at,
@@ -3225,9 +1969,9 @@ def generate_with_legacy_sdk(
         response = model.generate_content(
             prompt,
             generation_config={
-                "temperature": ROUND_UI_TEMPERATURE,
-                "top_p": ROUND_UI_TOP_P,
-                "max_output_tokens": ROUND_UI_MAX_OUTPUT_TOKENS,
+                "temperature": GENERATION_TEMPERATURE,
+                "top_p": GENERATION_TOP_P,
+                "max_output_tokens": GENERATION_MAX_OUTPUT_TOKENS,
                 "response_mime_type": "application/json",
             },
         )
@@ -3285,8 +2029,8 @@ def select_candidates_with_legacy_sdk(
         response = model.generate_content(
             prompt,
             generation_config={
-                "temperature": CANDIDATE_SELECTION_TEMPERATURE,
-                "top_p": CANDIDATE_SELECTION_TOP_P,
+                "temperature": GENERATION_TEMPERATURE,
+                "top_p": GENERATION_TOP_P,
                 "max_output_tokens": CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS,
                 "response_mime_type": "application/json",
             },
@@ -3365,8 +2109,6 @@ def generate_round_candidate(
         status="accepted",
         person_name=normalized["person_name"],
         actual_status=normalized["actual_status"],
-        date_of_birth=normalized["date_of_birth"],
-        date_of_death=normalized["date_of_death"],
         **(audit_meta or {}),
     )
     log_perf(
@@ -3380,20 +2122,16 @@ def generate_round_candidate(
     return model_name, normalized
 
 
-def choose_allowed_candidates(
+def choose_allowed_candidate(
     selection: CandidateSelection,
     forbidden: list[str],
-    limit: int,
-) -> tuple[list[LockedCandidate], list[str], list[str]]:
+) -> LockedCandidate:
     forbidden_keys = {normalize_name_key(name) for name in forbidden}
     seen_keys: set[str] = set()
-    accepted: list[LockedCandidate] = []
     rejected_names: list[str] = []
-    implausible_names: list[str] = []
+    verification_errors: list[str] = []
 
     for candidate in selection.candidates:
-        if len(accepted) >= limit:
-            break
         person_name = " ".join(candidate.person_name.split())
         key = normalize_name_key(person_name)
         if not person_name:
@@ -3401,243 +2139,144 @@ def choose_allowed_candidates(
         if key in seen_keys or key in forbidden_keys:
             rejected_names.append(person_name)
             continue
-        plausible = resolve_candidate_age_plausibility(person_name)
-        if plausible is False:
-            rejected_names.append(person_name)
-            implausible_names.append(person_name)
-            continue
         seen_keys.add(key)
-        accepted.append(
-            LockedCandidate(
-                person_name=person_name,
-                actual_status=candidate.actual_status,
-                source="candidate_selection",
-            )
-        )
-
-    return accepted, rejected_names, implausible_names
-
-
-def choose_reused_candidates_from_history(
-    ip_history: list[str],
-    selected: list[LockedCandidate],
-    limit: int,
-) -> list[LockedCandidate]:
-    selected_keys = {normalize_name_key(candidate.person_name) for candidate in selected}
-    reused: list[LockedCandidate] = []
-
-    for person_name in ip_history:
-        if len(reused) >= limit:
-            break
-        key = normalize_name_key(person_name)
-        if key in selected_keys:
+        try:
+            actual_status = determine_actual_status(person_name, candidate.actual_status)
+        except Exception as exc:
+            verification_errors.append(f"{person_name}: {exc}")
             continue
-        selected_keys.add(key)
-        reused.append(
-            LockedCandidate(
-                person_name=person_name,
-                actual_status=None,
-                source="ip_history_reuse",
-            )
+        return LockedCandidate(
+            person_name=person_name,
+            actual_status=actual_status,
+            source="candidate_selection",
         )
 
-    return reused
-
-
-def negotiate_round_candidates_sync(
-    forbidden: list[str],
-    ip_history: list[str],
-    model_candidates: list[str],
-    pool_size: int,
-    audit_meta: dict[str, object],
-) -> tuple[str, list[LockedCandidate]]:
-    client_ip_key = normalize_client_ip(str(audit_meta.get("client_ip_key", "unknown")))
-    working_forbidden = list(dict.fromkeys(forbidden))
-    retry_notes: list[str] = []
-    errors: list[str] = []
-    approved: list[LockedCandidate] = []
-    use_ip_pool = client_ip_key != "unknown"
-    if use_ip_pool:
-        approved = select_candidates_from_ip_pool(
-            client_ip_key,
-            working_forbidden,
-            pool_size,
-        )
-    last_successful_model: str | None = None
-
-    if approved:
-        working_forbidden = merge_names_recency_preserving(
-            working_forbidden,
-            [candidate.person_name for candidate in approved],
-        )
-        append_gemini_audit_log(
-            "candidate_bank.reuse",
-            status="accepted",
-            accepted_count=len(approved),
-            person_names=[candidate.person_name for candidate in approved],
-            source="ip_candidate_pool",
-            **audit_meta,
-        )
-        if len(approved) >= pool_size:
-            return "ip_candidate_pool", approved
-
-    bank_candidates = select_candidates_from_bank(
-        merge_names_recency_preserving(
-            working_forbidden,
-            [candidate.person_name for candidate in approved],
-        ),
-        pool_size - len(approved),
+    rejected_tail = ", ".join(rejected_names[:12]) if rejected_names else "none"
+    verification_tail = (
+        "; Unverified candidates: " + " | ".join(verification_errors[:5])
+        if verification_errors
+        else ""
     )
-    if bank_candidates:
-        approved.extend(bank_candidates)
-        if use_ip_pool:
-            remember_candidates_for_ip_pool(client_ip_key, bank_candidates)
-        working_forbidden = merge_names_recency_preserving(
-            working_forbidden,
-            [candidate.person_name for candidate in bank_candidates],
-        )
-        append_gemini_audit_log(
-            "candidate_bank.reuse",
-            status="accepted",
-            accepted_count=len(bank_candidates),
-            person_names=[candidate.person_name for candidate in bank_candidates],
-            source="candidate_bank",
-            **audit_meta,
-        )
-        if len(approved) >= pool_size:
-            return "candidate_bank", approved
+    raise ValueError(
+        f"Candidate selection returned no allowed person. Rejected candidates: {rejected_tail}{verification_tail}"
+    )
 
-    for attempt in range(SESSION_NEGOTIATION_ATTEMPTS):
-        if len(approved) >= pool_size:
-            break
 
-        remaining = pool_size - len(approved)
-        requested_candidate_count = min(
-            CANDIDATE_SELECTION_COUNT,
-            max(CANDIDATE_SELECTION_MIN_COUNT, remaining * 5),
+def choose_emergency_fallback_candidate(
+    forbidden: list[str],
+    source: str = "emergency_fallback",
+) -> LockedCandidate:
+    forbidden_order = {
+        normalize_name_key(name): index for index, name in enumerate(forbidden)
+    }
+    fallback_index = {name: i for i, name in enumerate(EMERGENCY_FALLBACK_NAMES)}
+    ranked_names = sorted(
+        EMERGENCY_FALLBACK_NAMES,
+        key=lambda name: (
+            0 if normalize_name_key(name) not in forbidden_order else 1,
+            forbidden_order.get(normalize_name_key(name), -1),
+            fallback_index.get(name, len(EMERGENCY_FALLBACK_NAMES)),
+        ),
+    )
+    verification_errors: list[str] = []
+    for person_name in ranked_names:
+        if normalize_name_key(person_name) in forbidden_order:
+            continue
+        try:
+            actual_status = determine_actual_status(person_name, None)
+        except Exception as exc:
+            verification_errors.append(f"{person_name}: {exc}")
+            continue
+        return LockedCandidate(
+            person_name=person_name,
+            actual_status=actual_status,
+            source=source,
         )
-        negotiation_forbidden = merge_names_recency_preserving(
-            working_forbidden,
-            [candidate.person_name for candidate in approved],
-        )
-        prompt = build_candidate_selection_prompt(
-            negotiation_forbidden,
-            requested_candidate_count,
-            retry_notes,
-        )
-        accepted_this_attempt = 0
 
-        for model_name in model_candidates:
-            try:
-                if modern_genai is not None:
-                    selection = select_candidates_with_modern_sdk(model_name, prompt, audit_meta)
-                else:
-                    selection = select_candidates_with_legacy_sdk(model_name, prompt, audit_meta)
-                candidates, rejected_names, implausible_names = choose_allowed_candidates(
-                    selection,
-                    negotiation_forbidden,
-                    remaining,
-                )
-                working_forbidden = merge_names_recency_preserving(
-                    working_forbidden,
-                    rejected_names,
-                )
-                if not candidates:
-                    rejected_tail = ", ".join(rejected_names[:12]) if rejected_names else "none"
-                    if implausible_names:
-                        raise ValueError(
-                            "Candidate negotiation returned no plausible-age people. "
-                            f"Rejected candidates: {rejected_tail}"
-                        )
-                    raise ValueError(
-                        "Candidate negotiation returned no newly allowed people. "
-                        f"Rejected candidates: {rejected_tail}"
-                    )
+    verification_tail = (
+        " Verification failures: " + " | ".join(verification_errors[:5])
+        if verification_errors
+        else ""
+    )
+    raise ValueError(
+        "Emergency fallback has no unused, status-verified candidate."
+        + verification_tail
+    )
 
-                approved.extend(candidates)
-                working_forbidden = merge_names_recency_preserving(
-                    working_forbidden,
-                    [candidate.person_name for candidate in candidates],
-                )
-                accepted_this_attempt += len(candidates)
-                last_successful_model = model_name
-                remember_candidates_in_bank(candidates)
-                if use_ip_pool:
-                    remember_candidates_for_ip_pool(client_ip_key, candidates)
-                append_gemini_audit_log(
-                    "gemini.candidate_selection_result",
-                    model=model_name,
-                    status="accepted",
-                    accepted_count=len(candidates),
-                    person_names=[candidate.person_name for candidate in candidates],
-                    **audit_meta,
-                )
-                if len(approved) >= pool_size:
-                    return last_successful_model, approved
-            except Exception as exc:
-                append_gemini_audit_log(
-                    "gemini.candidate_selection_result",
-                    model=model_name,
-                    status="rejected",
-                    error=str(exc),
-                    **audit_meta,
-                )
-                logger.warning("Candidate negotiation failed for %s: %s", model_name, exc)
-                errors.append(f"{model_name} negotiation attempt {attempt + 1}: {exc}")
-                retry_notes.append(build_retry_note(str(exc)))
-                if "Rejected candidates:" in str(exc):
-                    rejected_tail = str(exc).split("Rejected candidates:", 1)[1]
-                    rejected_names = [
-                        name.strip()
-                        for name in rejected_tail.split(",")
-                        if name.strip() and name.strip().lower() != "none"
-                    ]
-                    working_forbidden = merge_names_recency_preserving(
-                        working_forbidden,
-                        rejected_names,
-                    )
 
-        remaining = pool_size - len(approved)
-        if remaining <= 0:
-            break
-        if accepted_this_attempt == 0:
-            retry_notes.append(
-                "Your previous candidate batch still reused forbidden or duplicate people. "
-                "Go deeper and return a more diverse set of definitely different celebrities."
+def should_use_emergency_fallback(error_message: str) -> bool:
+    normalized = error_message.casefold()
+    return (
+        "candidate selection returned no allowed person" in normalized
+        or "all candidate-selection models failed" in normalized
+    )
+
+
+def select_allowed_candidate_sync(
+    forbidden: list[str],
+    model_candidates: list[str],
+    retry_notes: list[str],
+    audit_meta: dict[str, object],
+) -> tuple[str, LockedCandidate]:
+    if (
+        LOCAL_CANDIDATE_FIRST_HISTORY_SIZE > 0
+        and len({normalize_name_key(name) for name in forbidden})
+        >= LOCAL_CANDIDATE_FIRST_HISTORY_SIZE
+    ):
+        try:
+            candidate = choose_emergency_fallback_candidate(
+                forbidden,
+                source="local_verified_candidate_pool",
             )
-        retry_notes.append(
-            f"You still need to return {remaining} more unique allowed celebrities that are not in the forbidden list."
-        )
-        retry_notes = list(dict.fromkeys(retry_notes))
-
-    if len(approved) < pool_size:
-        reused = choose_reused_candidates_from_history(
-            ip_history,
-            approved,
-            pool_size - len(approved),
-        )
-        if reused:
-            approved.extend(reused)
             append_gemini_audit_log(
-                "gemini.candidate_selection_reuse",
-                status="used",
-                person_names=[candidate.person_name for candidate in reused],
-                reused_count=len(reused),
+                "gemini.candidate_selection_result",
+                model="local-verified-candidate-pool",
+                status="accepted",
+                person_name=candidate.person_name,
+                actual_status=candidate.actual_status,
+                reason="history_size_threshold",
+                forbidden_count=len(forbidden),
                 **audit_meta,
             )
+            return "local-verified-candidate-pool", candidate
+        except Exception as exc:
+            logger.warning("Local verified candidate selection failed: %s", exc)
 
-    if len(approved) >= pool_size:
-        return last_successful_model or "ip_history_reuse", approved
+    prompt = build_candidate_selection_prompt(forbidden, retry_notes)
+    errors: list[str] = []
 
-    error_tail = " | ".join(errors) if errors else "insufficient approved candidates"
-    raise RuntimeError(
-        "Unable to negotiate enough round candidates for this IP. " + error_tail
-    )
+    for model_name in model_candidates:
+        try:
+            if modern_genai is not None:
+                selection = select_candidates_with_modern_sdk(model_name, prompt, audit_meta)
+            else:
+                selection = select_candidates_with_legacy_sdk(model_name, prompt, audit_meta)
+            candidate = choose_allowed_candidate(selection, forbidden)
+            append_gemini_audit_log(
+                "gemini.candidate_selection_result",
+                model=model_name,
+                status="accepted",
+                person_name=candidate.person_name,
+                actual_status=candidate.actual_status,
+                **audit_meta,
+            )
+            return model_name, candidate
+        except Exception as exc:
+            append_gemini_audit_log(
+                "gemini.candidate_selection_result",
+                model=model_name,
+                status="rejected",
+                error=str(exc),
+                **audit_meta,
+            )
+            logger.warning("Candidate selection failed for %s: %s", model_name, exc)
+            errors.append(f"{model_name}: {exc}")
+
+    raise RuntimeError("All candidate-selection models failed. " + " | ".join(errors))
 
 
 def generate_single_round_sync(
     forbidden: list[str],
-    locked_candidate: LockedCandidate,
     model_candidates: list[str],
     race_models: bool = False,
 ) -> tuple[str, dict]:
@@ -3645,11 +2284,7 @@ def generate_single_round_sync(
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
 
     errors = []
-    working_forbidden = [
-        name
-        for name in list(dict.fromkeys(forbidden))
-        if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
-    ]
+    working_forbidden = list(dict.fromkeys(forbidden))
     retry_notes: list[str] = []
 
     for attempt in range(ROUND_GENERATION_ATTEMPTS):
@@ -3658,8 +2293,54 @@ def generate_single_round_sync(
             "attempt": attempt + 1,
             "audit_request_id": audit_request_id,
         }
+        locked_candidate: LockedCandidate | None = None
+        try:
+            _, locked_candidate = select_allowed_candidate_sync(
+                working_forbidden,
+                model_candidates,
+                retry_notes,
+                audit_meta,
+            )
+        except Exception as exc:
+            errors.append(f"candidate selection attempt {attempt + 1}: {exc}")
+            retry_notes.append(build_retry_note(str(exc)))
+            retry_notes = list(dict.fromkeys(retry_notes))
+            if should_use_emergency_fallback(str(exc)):
+                try:
+                    locked_candidate = choose_emergency_fallback_candidate(working_forbidden)
+                except Exception as fallback_exc:
+                    errors.append(
+                        f"emergency fallback attempt {attempt + 1}: {fallback_exc}"
+                    )
+                    retry_notes.append(build_retry_note(str(fallback_exc)))
+                    retry_notes = list(dict.fromkeys(retry_notes))
+                    continue
+                append_gemini_audit_log(
+                    "gemini.candidate_selection_fallback",
+                    status="used",
+                    person_name=locked_candidate.person_name,
+                    source=locked_candidate.source,
+                    reason=str(exc),
+                    **audit_meta,
+                )
+                logger.warning(
+                    "Using emergency fallback candidate %s after candidate-selection failure on attempt %s: %s",
+                    locked_candidate.person_name,
+                    attempt + 1,
+                    exc,
+                )
+            else:
+                continue
+
+        generation_forbidden = [
+            name
+            for name in working_forbidden
+            if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
+        ]
+
         prompt = build_generation_prompt(
-            trim_retry_notes(retry_notes),
+            generation_forbidden,
+            retry_notes,
             locked_person_name=locked_candidate.person_name,
             locked_actual_status=locked_candidate.actual_status,
         )
@@ -3667,28 +2348,34 @@ def generate_single_round_sync(
         if race_models and len(model_candidates) > 1:
             forbidden_names_to_add = []
             attempt_retry_notes = []
-            with concurrent.futures.ThreadPoolExecutor(
+            executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(model_candidates)
-            ) as executor:
-                future_to_model = {
-                    executor.submit(
-                        generate_round_candidate,
-                        model_name,
-                        prompt,
-                        working_forbidden,
-                        audit_meta | {"race_mode": True},
-                        locked_candidate.person_name,
-                        locked_candidate.actual_status,
-                    ): model_name
-                    for model_name in model_candidates
-                }
+            )
+            future_to_model = {
+                executor.submit(
+                    generate_round_candidate,
+                    model_name,
+                    prompt,
+                    generation_forbidden,
+                    audit_meta | {"race_mode": True},
+                    locked_candidate.person_name,
+                    locked_candidate.actual_status,
+                ): model_name
+                for model_name in model_candidates
+            }
+            executor_shutdown = False
+            try:
                 for future in concurrent.futures.as_completed(future_to_model):
                     model_name = future_to_model[future]
                     try:
-                        return future.result()
+                        result = future.result()
+                        for pending_future in future_to_model:
+                            if pending_future is not future:
+                                pending_future.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        executor_shutdown = True
+                        return result
                     except Exception as exc:
-                        if should_skip_candidate_on_portrait_failure(str(exc)):
-                            raise CandidatePortraitUnavailableError(str(exc)) from exc
                         logger.warning(
                             "Generation failed for %s on attempt %s: %s",
                             model_name,
@@ -3699,6 +2386,9 @@ def generate_single_round_sync(
                         attempt_retry_notes.append(build_retry_note(str(exc)))
                         if str(exc).startswith("Model returned forbidden person:"):
                             forbidden_names_to_add.append(str(exc).split(": ", 1)[1])
+            finally:
+                if not executor_shutdown:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
             working_forbidden.extend(forbidden_names_to_add)
             working_forbidden = list(dict.fromkeys(working_forbidden))
@@ -3710,14 +2400,12 @@ def generate_single_round_sync(
                 return generate_round_candidate(
                     model_name,
                     prompt,
-                    working_forbidden,
+                    generation_forbidden,
                     audit_meta | {"race_mode": False},
                     locked_candidate.person_name,
                     locked_candidate.actual_status,
                 )
             except Exception as exc:
-                if should_skip_candidate_on_portrait_failure(str(exc)):
-                    raise CandidatePortraitUnavailableError(str(exc)) from exc
                 logger.warning(
                     "Generation failed for %s on attempt %s: %s",
                     model_name,
@@ -3728,12 +2416,9 @@ def generate_single_round_sync(
                 if str(exc).startswith("Model returned forbidden person:"):
                     working_forbidden.append(str(exc).split(": ", 1)[1])
                 retry_notes.append(build_retry_note(str(exc)))
-                retry_notes = trim_retry_notes(retry_notes)
+                retry_notes = list(dict.fromkeys(retry_notes))
 
-    error_tail = " | ".join(errors)
-    if should_skip_candidate_on_generation_failure(error_tail):
-        raise CandidatePortraitUnavailableError(error_tail)
-    raise RuntimeError("All configured Gemini models failed. " + error_tail)
+    raise RuntimeError("All configured Gemini models failed. " + " | ".join(errors))
 
 
 def render_history_item(entry: dict) -> str:
@@ -3767,7 +2452,7 @@ def render_finale_html(session: dict) -> str:
             {history_list}
         </div>
         <div class='mt-10 flex justify-center'>
-            <button onclick='startGame()' class='rounded-full bg-white px-10 py-4 text-lg font-black uppercase tracking-[0.2em] text-black transition hover:scale-105 active:scale-95'>
+            <button onclick='location.reload()' class='rounded-full bg-white px-10 py-4 text-lg font-black uppercase tracking-[0.2em] text-black transition hover:scale-105 active:scale-95'>
                 Play Again
             </button>
         </div>
@@ -3775,40 +2460,9 @@ def render_finale_html(session: dict) -> str:
     """
 
 
-def build_portrait_fallback_svg(person_name: str) -> str:
-    display_name = " ".join(person_name.split())[:60] or "Unknown"
-    name_tokens = [token for token in display_name.split() if token]
-    initials = "".join(token[0].upper() for token in name_tokens[:2]) or "?"
-    escaped_initials = html.escape(initials)
-    escaped_name = html.escape(display_name)
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600" role="img" aria-label="{escaped_name}">
-  <defs>
-    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#60a5fa" />
-      <stop offset="100%" stop-color="#c084fc" />
-    </linearGradient>
-    <radialGradient id="avatar" cx="35%" cy="30%" r="85%">
-      <stop offset="0%" stop-color="#4338ca" />
-      <stop offset="100%" stop-color="#312e81" />
-    </radialGradient>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="18" stdDeviation="26" flood-color="#0f172a" flood-opacity="0.28" />
-    </filter>
-  </defs>
-  <g filter="url(#glow)">
-    <circle cx="300" cy="300" r="212" fill="url(#avatar)" />
-    <circle cx="300" cy="300" r="212" fill="none" stroke="url(#ring)" stroke-width="12" />
-    <circle cx="300" cy="300" r="126" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
-  </g>
-  <text x="300" y="332" text-anchor="middle" fill="#f8fafc" font-size="128" font-family="Arial, Helvetica, sans-serif" font-weight="700">{escaped_initials}</text>
-</svg>"""
-
-
 def collect_session_reserved_names(session: dict) -> list[str]:
     reserved_names: list[str] = []
-    reserved_names.extend(session.get("reserved_names", []))
     reserved_names.extend(session.get("used_names", []))
-    reserved_names.extend(session.get("excluded_candidates", []))
     active_round = session.get("active_round") or {}
     if active_round.get("person_name"):
         reserved_names.append(str(active_round["person_name"]))
@@ -3821,228 +2475,31 @@ def collect_session_reserved_names(session: dict) -> list[str]:
     return merge_names_recency_preserving([], reserved_names)
 
 
-def get_session_round_candidate(session: dict, target_round_number: int) -> LockedCandidate:
-    round_candidates = session.get("round_candidates", [])
-    index = target_round_number - 1
-    if index < 0 or index >= len(round_candidates):
-        raise RuntimeError(f"No negotiated candidate available for round {target_round_number}")
-
-    candidate_data = round_candidates[index]
-    return LockedCandidate(
-        person_name=str(candidate_data["person_name"]),
-        actual_status=candidate_data.get("actual_status"),
-        source=str(candidate_data.get("source", "candidate_selection")),
-    )
-
-
-def verify_locked_candidate_status(locked_candidate: LockedCandidate) -> LockedCandidate:
-    verified_status = resolve_person_actual_status(locked_candidate.person_name)
-    if not verified_status:
-        return locked_candidate
-    if locked_candidate.actual_status == verified_status:
-        return locked_candidate
-    logger.warning(
-        "Corrected locked status for %s from %s to %s",
-        locked_candidate.person_name,
-        locked_candidate.actual_status,
-        verified_status,
-    )
-    return LockedCandidate(
-        person_name=locked_candidate.person_name,
-        actual_status=verified_status,
-        source=f"{locked_candidate.source}_status_verified",
-    )
-
-
-def build_round_generation_forbidden(
-    session: dict,
-    locked_candidate: LockedCandidate,
-) -> list[str]:
-    forbidden: list[str] = []
-    forbidden.extend(get_ip_history(session.get("client_ip_key", "unknown")))
-    forbidden.extend(collect_ip_reserved_names(session.get("client_ip_key", "unknown")))
-    forbidden.extend(collect_session_reserved_names(session))
-    forbidden = merge_names_recency_preserving([], forbidden)
-    return [
-        name
-        for name in forbidden
-        if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
-    ]
-
-
-def build_candidate_negotiation_forbidden(session: dict) -> list[str]:
-    client_ip_key = session.get("client_ip_key", "unknown")
-    forbidden: list[str] = []
-    forbidden.extend(get_ip_history(client_ip_key))
-    forbidden.extend(collect_ip_reserved_names(client_ip_key))
-    forbidden.extend(collect_session_reserved_names(session))
-    return merge_names_recency_preserving([], forbidden)
-
-
-def should_skip_candidate_on_portrait_failure(error_message: str) -> bool:
-    lowered = error_message.lower()
-    return (
-        "no valid wikimedia portrait found" in lowered
-        or "portrait_search_query resolution failed" in lowered
-    )
-
-
-def should_skip_candidate_on_generation_failure(error_message: str) -> bool:
-    lowered = error_message.lower()
-    return (
-        should_skip_candidate_on_portrait_failure(error_message)
-        or "guessing ui places guess buttons over the portrait" in lowered
-        or "guessing ui is missing guess buttons" in lowered
-        or "reveal ui is missing next-round button" in lowered
-        or "guessing ui includes spoiler wording" in lowered
-        or "unsupported tailwind class" in lowered
-        or "portrait placeholder" in lowered
-        or "old image placeholder" in lowered
-        or "returned non-json output" in lowered
-        or "returned non-json candidate-selection output" in lowered
-        or "json extraction failed" in lowered
-        or "model returned forbidden person:" in lowered
-        or "locked person" in lowered
-        or "locked status" in lowered
-        or "date_of_birth" in lowered
-        or "date_of_death" in lowered
-    )
-
-
-def exclude_round_candidate(
-    session: dict,
-    target_round_number: int,
-    locked_candidate: LockedCandidate,
-    reason: str,
-) -> None:
-    candidate_index = target_round_number - 1
-    round_candidates = session.get("round_candidates", [])
-    if 0 <= candidate_index < len(round_candidates):
-        round_candidates.pop(candidate_index)
-
-    session["reserved_names"] = [
-        name
-        for name in session.get("reserved_names", [])
-        if normalize_name_key(name) != normalize_name_key(locked_candidate.person_name)
-    ]
-    session["excluded_candidates"] = merge_names_recency_preserving(
-        session.get("excluded_candidates", []),
-        [locked_candidate.person_name],
-    )
-    forget_candidate_from_ip_pool(session.get("client_ip_key", "unknown"), locked_candidate.person_name)
-    forget_candidate_from_bank(locked_candidate.person_name)
-    append_gemini_audit_log(
-        "round.candidate_excluded",
-        status="excluded",
-        person_name=locked_candidate.person_name,
-        reason=reason,
-        session_id=session.get("session_id"),
-        target_round_number=target_round_number,
-    )
-
-
 async def generate_round_payload(
     session: dict,
     target_round_number: int,
     model_candidates: list[str],
     race_models: bool = False,
 ) -> tuple[str, dict]:
-    portrait_skip_count = 0
-
-    while True:
-        if len(session.get("round_candidates", [])) < target_round_number:
-            await top_up_session_candidates(session.get("session_id"))
-        if len(session.get("round_candidates", [])) < target_round_number:
-            raise RuntimeError(
-                f"No negotiated candidate available for round {target_round_number}"
-            )
-
-        locked_candidate = get_session_round_candidate(session, target_round_number)
-        if STATUS_VALIDATION_ENABLED:
-            append_gemini_audit_log(
-                "round.status_validation",
-                status="enabled",
-                person_name=locked_candidate.person_name,
-                proposed_status=locked_candidate.actual_status,
-                target_round_number=target_round_number,
-                session_id=session.get("session_id"),
-            )
-            verified_candidate = await asyncio.to_thread(
-                verify_locked_candidate_status,
-                locked_candidate,
-            )
-            if verified_candidate != locked_candidate:
-                session["round_candidates"][target_round_number - 1]["actual_status"] = (
-                    verified_candidate.actual_status
-                )
-                session["round_candidates"][target_round_number - 1]["source"] = (
-                    verified_candidate.source
-                )
-                locked_candidate = verified_candidate
-        else:
-            append_gemini_audit_log(
-                "round.status_validation",
-                status="disabled",
-                person_name=locked_candidate.person_name,
-                proposed_status=locked_candidate.actual_status,
-                target_round_number=target_round_number,
-                session_id=session.get("session_id"),
-            )
-            if locked_candidate.actual_status is not None:
-                locked_candidate = LockedCandidate(
-                    person_name=locked_candidate.person_name,
-                    actual_status=None,
-                    source=f"{locked_candidate.source}_status_unlocked",
-                )
-
-        forbidden = build_round_generation_forbidden(session, locked_candidate)
-        try:
-            model_name, round_data = await asyncio.to_thread(
-                generate_single_round_sync,
-                forbidden,
-                locked_candidate,
-                model_candidates,
-                race_models,
-            )
-        except CandidatePortraitUnavailableError as exc:
-            portrait_skip_count += 1
-            exclude_round_candidate(
-                session,
-                target_round_number,
-                locked_candidate,
-                str(exc),
-            )
-            logger.warning(
-                "Skipping %s for round %s after portrait failure: %s",
-                locked_candidate.person_name,
-                target_round_number,
-                exc,
-            )
-            schedule_candidate_topup(session.get("session_id"))
-            if portrait_skip_count >= max(SESSION_CANDIDATE_TARGET_COUNT, 10):
-                raise RuntimeError(
-                    f"Unable to find a portraitable candidate for round {target_round_number}"
-                ) from exc
-            continue
-
-        session["used_names"] = merge_names_recency_preserving(
-            session.get("used_names", []),
-            [round_data["person_name"]],
-        )
-        remember_candidates_in_bank(
-            [
-                LockedCandidate(
-                    person_name=round_data["person_name"],
-                    actual_status=round_data["actual_status"],
-                    source="round_generation",
-                )
-            ]
-        )
-        session["round_candidates"][target_round_number - 1]["actual_status"] = round_data["actual_status"]
-        runtime_state["last_model"] = model_name
-        runtime_state["last_error"] = None
-        logger.info("Generated round %s using %s", target_round_number, model_name)
-        return model_name, round_data
+    forbidden = collect_session_reserved_names(session)
+    if GLOBAL_HISTORY_PROMPT_LIMIT > 0:
+        forbidden.extend(get_global_history()[-GLOBAL_HISTORY_PROMPT_LIMIT:])
+    forbidden = merge_names_recency_preserving([], forbidden)
+    model_name, round_data = await asyncio.to_thread(
+        generate_single_round_sync,
+        forbidden,
+        model_candidates,
+        race_models,
+    )
+    session["used_names"] = merge_names_recency_preserving(
+        session.get("used_names", []),
+        [round_data["person_name"]],
+    )
+    runtime_state["last_model"] = model_name
+    runtime_state["last_error"] = None
+    update_global_history([round_data["person_name"]])
+    logger.info("Generated round %s using %s", target_round_number, model_name)
+    return model_name, round_data
 
 
 async def generate_round_for_session(
@@ -4088,8 +2545,10 @@ async def prefetch_next_rounds(session_id: str) -> None:
             current_session = sessions.get(session_id)
             if current_session is None:
                 return
-            current_session["queued_rounds"].append(round_data)
-            current_session["prefetch_error"] = None
+            round_lock: asyncio.Lock = current_session.get("round_lock") or asyncio.Lock()
+            async with round_lock:
+                current_session["queued_rounds"].append(round_data)
+                current_session["prefetch_error"] = None
     except Exception as exc:
         current_session = sessions.get(session_id)
         if current_session is not None:
@@ -4099,74 +2558,6 @@ async def prefetch_next_rounds(session_id: str) -> None:
         current_session = sessions.get(session_id)
         if current_session is not None:
             current_session["prefetch_task"] = None
-
-
-async def top_up_session_candidates(session_id: str) -> None:
-    session = sessions.get(session_id)
-    if not session:
-        return
-
-    client_ip_key = session.get("client_ip_key", "unknown")
-    try:
-        while True:
-            current_session = sessions.get(session_id)
-            if current_session is None:
-                return
-
-            needed = SESSION_CANDIDATE_TARGET_COUNT - len(current_session.get("round_candidates", []))
-            if needed <= 0:
-                return
-
-            forbidden = build_candidate_negotiation_forbidden(current_session)
-            ip_history = get_ip_history(client_ip_key)
-            _, new_candidates = await asyncio.to_thread(
-                negotiate_round_candidates_sync,
-                forbidden,
-                ip_history,
-                BACKGROUND_MODEL_CANDIDATES,
-                needed,
-                {
-                    "session_id": session_id,
-                    "client_ip_key": client_ip_key,
-                    "background_topup": True,
-                },
-            )
-
-            current_session = sessions.get(session_id)
-            if current_session is None:
-                return
-            if not new_candidates:
-                return
-
-            new_names = [candidate.person_name for candidate in new_candidates]
-            current_session["reserved_names"] = merge_names_recency_preserving(
-                current_session.get("reserved_names", []),
-                new_names,
-            )
-            current_session["round_candidates"].extend(
-                {
-                    "person_name": candidate.person_name,
-                    "actual_status": candidate.actual_status,
-                    "source": candidate.source,
-                }
-                for candidate in new_candidates
-            )
-            current_session["candidate_topup_error"] = None
-            logger.info(
-                "Background candidate top-up added %s celebrities for session %s (%s total reserved)",
-                len(new_candidates),
-                session_id,
-                len(current_session["round_candidates"]),
-            )
-    except Exception as exc:
-        current_session = sessions.get(session_id)
-        if current_session is not None:
-            current_session["candidate_topup_error"] = str(exc)
-        logger.warning("Candidate top-up failed for session %s: %s", session_id, exc)
-    finally:
-        current_session = sessions.get(session_id)
-        if current_session is not None:
-            current_session["candidate_topup_task"] = None
 
 
 def schedule_prefetch(session_id: str) -> None:
@@ -4185,35 +2576,27 @@ def schedule_prefetch(session_id: str) -> None:
     session["prefetch_task"] = asyncio.create_task(prefetch_next_rounds(session_id))
 
 
-def schedule_candidate_topup(session_id: str) -> None:
-    session = sessions.get(session_id)
-    if not session:
-        return
-    if len(session.get("round_candidates", [])) >= SESSION_CANDIDATE_TARGET_COUNT:
-        return
-
-    existing_task = session.get("candidate_topup_task")
-    if existing_task is not None and not existing_task.done():
-        return
-
-    session["candidate_topup_task"] = asyncio.create_task(top_up_session_candidates(session_id))
-
-
 async def get_next_round_for_session(session_id: str, session: dict) -> dict:
-    queued_rounds = session.get("queued_rounds", [])
-    if queued_rounds:
-        queued_round = queued_rounds.pop(0)
-        session["active_round"] = queued_round
-        return queued_round
+    round_lock: asyncio.Lock = session.get("round_lock") or asyncio.Lock()
 
+    # Fast path: grab from the prefetch queue while holding the lock.
+    async with round_lock:
+        queued_rounds = session.get("queued_rounds", [])
+        if queued_rounds:
+            queued_round = queued_rounds.pop(0)
+            session["active_round"] = queued_round
+            return queued_round
+
+    # Wait for a running prefetch to deliver a round, then dequeue under the lock.
     existing_task = session.get("prefetch_task")
     if existing_task is not None and not existing_task.done():
         while True:
-            queued_rounds = session.get("queued_rounds", [])
-            if queued_rounds:
-                queued_round = queued_rounds.pop(0)
-                session["active_round"] = queued_round
-                return queued_round
+            async with round_lock:
+                queued_rounds = session.get("queued_rounds", [])
+                if queued_rounds:
+                    queued_round = queued_rounds.pop(0)
+                    session["active_round"] = queued_round
+                    return queued_round
 
             existing_task = session.get("prefetch_task")
             if existing_task is None or existing_task.done():
@@ -4229,14 +2612,49 @@ async def get_next_round_for_session(session_id: str, session: dict) -> dict:
     )
 
 
-app = FastAPI(title="Alive or Dead POC")
+async def _session_cleanup_loop() -> None:
+    """Background coroutine that evicts sessions older than SESSION_TTL_SECONDS."""
+    while True:
+        await asyncio.sleep(SESSION_CLEANUP_INTERVAL_SECONDS)
+        cutoff = time.monotonic() - SESSION_TTL_SECONDS
+        stale = [
+            sid for sid, s in list(sessions.items())
+            if s.get("created_at", 0) < cutoff
+        ]
+        for sid in stale:
+            session = sessions.pop(sid, None)
+            if session is None:
+                continue
+            task = session.get("prefetch_task")
+            if task and not task.done():
+                task.cancel()
+        if stale:
+            logger.info("Session cleanup: evicted %d stale session(s)", len(stale))
+
+
+
+
+@asynccontextmanager
+async def _lifespan(app):  # noqa: ARG001
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Alive or Dead POC", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -4274,24 +2692,6 @@ async def index():
                     linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
                 background-size: 28px 28px;
                 mask-image: linear-gradient(180deg, rgba(0,0,0,0.9), rgba(0,0,0,0.2));
-            }}
-            .round-fragment {{
-                width: 100%;
-            }}
-            .round-fragment > * {{
-                width: 100% !important;
-                max-width: 100% !important;
-                box-sizing: border-box;
-                margin-left: auto;
-                margin-right: auto;
-            }}
-            .round-fragment button[onclick*="submitGuess"],
-            .round-fragment a[onclick*="submitGuess"] {{
-                pointer-events: auto !important;
-                cursor: pointer !important;
-                opacity: 1 !important;
-                position: relative;
-                z-index: 40;
             }}
         </style>
     </head>
@@ -4384,10 +2784,9 @@ async def index():
             }}
 
             async function startGame() {{
-                sessionId = null;
                 renderLoader(
-                    'Identifying Your Celebrities',
-                    'The game is negotiating your celebrity pool and building round one. The game will start momentarily.'
+                    'Designing Round One',
+                    'Gemini is generating the first challenge in real time.'
                 );
 
                 try {{
@@ -4455,85 +2854,35 @@ async def status():
     return {
         "last_error": runtime_state["last_error"],
         "last_model": runtime_state["last_model"],
-        "status_validation_enabled": STATUS_VALIDATION_ENABLED,
         "gemini_audit_log_enabled": GEMINI_AUDIT_LOG_ENABLED,
         "gemini_audit_log_file": str(GEMINI_AUDIT_LOG_FILE),
         "image_url_validation_enabled": IMAGE_URL_VALIDATION_ENABLED,
+        "status_verification_enabled": STATUS_VERIFICATION_ENABLED,
+        "status_verification_required": STATUS_VERIFICATION_REQUIRED,
+        "local_candidate_first_history_size": LOCAL_CANDIDATE_FIRST_HISTORY_SIZE,
         "wikimedia_search_timeout_seconds": WIKIMEDIA_SEARCH_TIMEOUT_SECONDS,
-        "portrait_fallback_mode": PORTRAIT_FALLBACK_MODE,
-        "wikimedia_429_retry_count": WIKIMEDIA_429_RETRY_COUNT,
-        "wikimedia_429_retry_backoff_ms": WIKIMEDIA_429_RETRY_BACKOFF_MS,
-        "repeat_history_scope": "per_ip_fifo",
-        "ip_history_max_names": IP_HISTORY_MAX_NAMES,
-        "session_candidate_count": SESSION_APPROVED_POOL_SIZE,
-        "session_candidate_target_count": SESSION_CANDIDATE_TARGET_COUNT,
-        "candidate_ip_pool_file": str(CANDIDATE_IP_POOL_FILE),
-        "candidate_ip_pool_max_entries": IP_CANDIDATE_POOL_MAX_ENTRIES,
-        "candidate_ip_pool_ttl_seconds": IP_CANDIDATE_POOL_TTL_SECONDS,
-        "candidate_bank_file": str(CANDIDATE_BANK_FILE),
-        "candidate_bank_max_entries": CANDIDATE_BANK_MAX_ENTRIES,
-        "candidate_bank_ttl_seconds": CANDIDATE_BANK_TTL_SECONDS,
-        "wikimedia_min_request_interval_ms": WIKIMEDIA_MIN_REQUEST_INTERVAL_MS,
         "image_contract": "backend_wikimedia_query_resolution",
     }
 
 
-@app.get("/portrait-fallback")
-async def portrait_fallback(name: str = "Unknown"):
-    return Response(
-        content=build_portrait_fallback_svg(name),
-        media_type="image/svg+xml",
-    )
-
-
 @app.post("/api/start-session")
-async def start_session(request: FastAPIRequest):
+async def start_session():
     session_id = str(uuid.uuid4())
-    client_ip_key = normalize_client_ip(extract_client_ip(request))
-    ip_history = get_ip_history(client_ip_key)
-    forbidden = merge_names_recency_preserving(
-        ip_history,
-        collect_ip_reserved_names(client_ip_key),
-    )
+    session = {
+        "score": 0,
+        "round_number": 0,
+        "history": [],
+        "used_names": [],
+        "active_round": None,
+        "queued_rounds": [],
+        "prefetch_task": None,
+        "prefetch_error": None,
+        "created_at": time.monotonic(),   # used by session cleanup TTL
+        "round_lock": asyncio.Lock(),      # serialises queued_rounds access
+    }
+    sessions[session_id] = session
 
     try:
-        _, round_candidates = await asyncio.to_thread(
-            negotiate_round_candidates_sync,
-            forbidden,
-            ip_history,
-            FAST_MODEL_CANDIDATES,
-            max(SESSION_APPROVED_POOL_SIZE, ROUNDS_PER_GAME),
-            {
-                "session_id": session_id,
-                "client_ip_key": client_ip_key,
-            },
-        )
-        reserved_names = [candidate.person_name for candidate in round_candidates]
-        session = {
-            "session_id": session_id,
-            "client_ip_key": client_ip_key,
-            "score": 0,
-            "round_number": 0,
-            "history": [],
-            "used_names": [],
-            "reserved_names": reserved_names,
-            "excluded_candidates": [],
-            "round_candidates": [
-                {
-                    "person_name": candidate.person_name,
-                    "actual_status": candidate.actual_status,
-                    "source": candidate.source,
-                }
-                for candidate in round_candidates
-            ],
-            "active_round": None,
-            "queued_rounds": [],
-            "prefetch_task": None,
-            "prefetch_error": None,
-            "candidate_topup_task": None,
-            "candidate_topup_error": None,
-        }
-        sessions[session_id] = session
         round_data = await generate_round_for_session(
             session,
             1,
@@ -4543,12 +2892,14 @@ async def start_session(request: FastAPIRequest):
     except Exception as exc:
         runtime_state["last_error"] = str(exc)
         sessions.pop(session_id, None)
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        logger.error("start_session generation failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Round generation failed. Please try again.",
+        ) from exc
 
     session["round_number"] = 1
-    update_ip_history(client_ip_key, [round_data["person_name"]])
     schedule_prefetch(session_id)
-    schedule_candidate_topup(session_id)
     return {
         "session_id": session_id,
         "status": "ready",
@@ -4569,12 +2920,14 @@ async def next_round(session_id: str):
         round_data = await get_next_round_for_session(session_id, session)
     except Exception as exc:
         runtime_state["last_error"] = str(exc)
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        logger.error("next_round generation failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Round generation failed. Please try again.",
+        ) from exc
 
     session["round_number"] += 1
-    update_ip_history(session.get("client_ip_key", "unknown"), [round_data["person_name"]])
     schedule_prefetch(session_id)
-    schedule_candidate_topup(session_id)
     return {"status": "playing", "guessing_ui_html": round_data["guessing_ui_html"]}
 
 
@@ -4615,14 +2968,12 @@ async def guess(request: FastAPIRequest):
         "</div>"
         "</div>"
     )
-    return {
-        "reveal_ui_html": injection
-        + round_data["reveal_ui_html"]
-        + build_mobile_next_round_bar(round_data.get("next_round_label", "Next Round"))
-    }
+    return {"reveal_ui_html": injection + round_data["reveal_ui_html"]}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    _host = os.getenv("UVICORN_HOST", "127.0.0.1")
+    _port = int(os.getenv("UVICORN_PORT", "8000"))
+    uvicorn.run(app, host=_host, port=_port)
