@@ -908,7 +908,7 @@ def build_generation_prompt(
 
     prompt_body = SYSTEM_PROMPT.replace("[NAMELIST]", forbidden_tail)
     if category.lower() == "random":
-        cat_rule = "- Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable. To ensure variety, randomly pick someone from a different era, profession, or global region than the obvious A-list celebrities."
+        cat_rule = "- Pick one famous person who was born between 1904 and 2016 (their current age would be between 8 and 120 years old). To ensure variety, randomly pick someone from a different modern profession or global region than the obvious A-list celebrities. DO NOT PICK ANCIENT HISTORICAL FIGURES."
     else:
         cat_rule = f'- Pick one famous person from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
     prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
@@ -934,7 +934,7 @@ def build_candidate_selection_prompt(
 
     prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
     if category.lower() == "random":
-        cat_rule = "- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable. DO NOT pick the most obvious A-list actors; instead pick people from diverse eras, professions, or global regions."
+        cat_rule = "- Pick famous people who were born between 1904 and 2016 (their current age would be between 8 and 120 years old). DO NOT pick the most obvious A-list actors; instead pick people from diverse modern professions or global regions. DO NOT PICK ANCIENT HISTORICAL FIGURES."
     else:
         cat_rule = f'- Pick famous people from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
     prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
