@@ -714,6 +714,7 @@ Round requirements:
   - exactly one portrait `<img>` whose `src` is the exact literal `__PORTRAIT_IMAGE_URL__`
   - `submitGuess('alive')` and `submitGuess('dead')` buttons
 - The reveal page must match the same theme and include `loadNextRound()`.
+- When stating the person's status on the reveal page, ALWAYS use present tense for living people (e.g. "is alive", NEVER "was alive").
 - The person cannot be one of these formerly selected people: [NAMELIST]
 
 Output rules:
