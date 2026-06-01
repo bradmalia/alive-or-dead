@@ -2541,7 +2541,7 @@ async def generate_round_payload(
     race_models: bool = False,
 ) -> tuple[str, dict]:
     forbidden = collect_session_reserved_names(session)
-    if GLOBAL_HISTORY_PROMPT_LIMIT > 0:
+    if session.get("mode", "survival") != "survival" and GLOBAL_HISTORY_PROMPT_LIMIT > 0:
         forbidden.extend(get_global_history()[-GLOBAL_HISTORY_PROMPT_LIMIT:])
     forbidden = merge_names_recency_preserving([], forbidden)
     model_name, round_data = await asyncio.to_thread(
@@ -2777,8 +2777,8 @@ async def index():
                         <div>
                             <label class="block text-xs uppercase tracking-[0.2em] text-zinc-400 mb-2">Game Mode</label>
                             <select id="mode-select" class="w-full rounded-xl border border-white/10 bg-zinc-900 px-4 py-3 text-white outline-none focus:border-amber-400">
+                                <option value="survival" selected>Infinite Survival (10s Timer)</option>
                                 <option value="classic">Classic (10 Rounds)</option>
-                                <option value="survival">Infinite Survival (10s Timer)</option>
                             </select>
                         </div>
                         <div>
@@ -2847,7 +2847,7 @@ async def index():
         <script>
 
             let sessionId = null;
-            let sessionMode = 'classic';
+            let sessionMode = 'survival';
             let survivalTimer = null;
             let isGameOver = false;
             const START_SESSION_URL = {json.dumps(start_session_url)};
@@ -2973,7 +2973,7 @@ async def index():
             }}
 
             async function startGame() {{
-                sessionMode = document.getElementById('mode-select') ? document.getElementById('mode-select').value : 'classic';
+                sessionMode = document.getElementById('mode-select') ? document.getElementById('mode-select').value : 'survival';
                 const category = document.getElementById('category-input') ? document.getElementById('category-input').value : 'Random';
 
                 renderLoader(
@@ -3093,7 +3093,7 @@ async def start_session(request: FastAPIRequest):
         "prefetch_error": None,
         "created_at": time.monotonic(),
         "round_lock": asyncio.Lock(),
-        "mode": data.get("mode", "classic"),
+        "mode": data.get("mode", "survival"),
         "category": data.get("category", "Random"),
     }
     sessions[session_id] = session
