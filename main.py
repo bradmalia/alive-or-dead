@@ -38,7 +38,7 @@ from urllib.request import Request as UrlRequest, urlopen
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from pydantic import field_validator
 
@@ -908,7 +908,7 @@ def build_generation_prompt(
 
     prompt_body = SYSTEM_PROMPT.replace("[NAMELIST]", forbidden_tail)
     if category.lower() == "random":
-        cat_rule = "- Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable."
+        cat_rule = "- Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable. To ensure variety, randomly pick someone from a different era, profession, or global region than the obvious A-list celebrities."
     else:
         cat_rule = f'- Pick one famous person from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
     prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
@@ -934,7 +934,7 @@ def build_candidate_selection_prompt(
 
     prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
     if category.lower() == "random":
-        cat_rule = "- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable."
+        cat_rule = "- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable. DO NOT pick the most obvious A-list actors; instead pick people from diverse eras, professions, or global regions."
     else:
         cat_rule = f'- Pick famous people from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
     prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
@@ -2719,6 +2719,13 @@ app.add_middleware(
 )
 
 
+@app.get("/static/{filename}")
+async def serve_static(filename: str):
+    path = Path(filename)
+    if path.is_file() and filename.endswith(".png"):
+        return FileResponse(path)
+    raise HTTPException(status_code=404)
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     start_session_url = app_path("/api/start-session")
@@ -2770,7 +2777,7 @@ async def index():
                         Dead
                     </h1>
                     <p class="mt-6 max-w-2xl text-lg leading-relaxed text-zinc-300 sm:text-xl">
-                        Gemini designs each round on demand, then the backend resolves and verifies a matching Wikimedia portrait before the round is shown.
+                        Experience the ultimate trivia showdown! Gemini AI dynamically crafts every single round just for you, digging up fascinating facts while our backend frantically scours Wikimedia to find the perfect portrait. Will you survive the AI's unpredictable challenges?
                     </p>
                     
                     <!-- New Game Options -->
@@ -2804,18 +2811,7 @@ async def index():
                 </div>
                 <div class="relative hidden lg:block">
                     <div class="absolute inset-0 rotate-[-7deg] rounded-[2.75rem] bg-gradient-to-br from-amber-400/35 via-rose-500/20 to-sky-400/20 blur-3xl"></div>
-                    <div class="relative overflow-hidden rounded-[2.5rem] border border-white/10 bg-zinc-950/80 p-6 shadow-2xl">
-                        <div class="flex items-center justify-between">
-                            <p class="text-xs font-bold uppercase tracking-[0.42em] text-zinc-500">Generative Round</p>
-                            <p class="rounded-full border border-white/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.3em] text-amber-200">Live</p>
-                        </div>
-                        <div class="mt-6 grid gap-4">
-                            <div class="rounded-[2rem] border border-white/10 bg-gradient-to-br from-white/10 to-white/0 p-5">
-                                <p class="text-xs uppercase tracking-[0.35em] text-zinc-400">Design brief</p>
-                                <p class="mt-3 text-2xl font-black uppercase tracking-tight">Poster-scale names. Tabloid tension. Verified Wikimedia portraits.</p>
-                            </div>
-                        </div>
-                    </div>
+                    <img src="{app_path('/static/start_menu.png')}" class="relative w-full h-auto object-cover rounded-[2.5rem] border border-white/10 shadow-2xl" alt="Gameplay screenshot">
                 </div>
             </div>
         </div>
