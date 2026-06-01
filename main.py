@@ -2798,6 +2798,7 @@ async def index():
                                 <button onclick="setCategory('Rock & Roll Legends')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Rockstars</button>
                                 <button onclick="setCategory('Legendary Comedians')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Comedians</button>
                                 <button onclick="setCategory('Historical Figures')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Historical</button>
+                                <button onclick="setCategory('Sports Legends')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Sports</button>
                             </div>
                             <input type="text" id="category-input" placeholder="Or type a custom category..." class="w-full rounded-xl border border-white/10 bg-zinc-900 px-4 py-3 text-white outline-none focus:border-amber-400" value="Random">
                         </div>
@@ -2814,7 +2815,7 @@ async def index():
                 </div>
                 <div class="relative hidden lg:block">
                     <div class="absolute inset-0 rotate-[-7deg] rounded-[2.75rem] bg-gradient-to-br from-amber-400/35 via-rose-500/20 to-sky-400/20 blur-3xl"></div>
-                    <img src="{app_path('/static/gameplay_marketing.png')}" class="relative w-full h-auto object-cover rounded-[2.5rem] border border-white/10 shadow-2xl" alt="Gameplay screenshot">
+                    <img src="{app_path('/static/gameplay_real.png')}" class="relative w-full h-auto object-cover rounded-[2.5rem] border border-white/10 shadow-2xl" alt="Gameplay screenshot">
                 </div>
             </div>
         </div>
