@@ -29,6 +29,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import sqlite3
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
@@ -58,6 +59,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+DB_PATH = Path("leaderboard.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS leaderboard (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            initials TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
 api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 if legacy_genai and api_key:
@@ -104,7 +124,7 @@ LOCAL_CANDIDATE_FIRST_HISTORY_SIZE = int(
 )
 GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.35"))
 GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.8"))
-GENERATION_MAX_OUTPUT_TOKENS = int(os.getenv("GENERATION_MAX_OUTPUT_TOKENS", "4000"))
+GENERATION_MAX_OUTPUT_TOKENS = int(os.getenv("GENERATION_MAX_OUTPUT_TOKENS", "8192"))
 CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS = int(
     os.getenv("CANDIDATE_SELECTION_MAX_OUTPUT_TOKENS", "2000")
 )
@@ -130,13 +150,13 @@ IMAGE_FETCH_USER_AGENT = os.getenv(
 )
 WIKIMEDIA_API_USER_AGENT = os.getenv(
     "WIKIMEDIA_API_USER_AGENT",
-    f"AliveOrDeadPOC/{APP_VERSION} (wikimedia search)",
+    f"AliveOrDeadPOC-{uuid.uuid4().hex[:8]}/{APP_VERSION} (aliveordeadbot@example.com)",
 )
 FAST_MODEL_CANDIDATES = [
     item.strip()
     for item in os.getenv(
         "GEMINI_FAST_MODELS",
-        "gemini-2.5-flash-lite,gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
     ).split(",")
     if item.strip()
 ]
@@ -144,7 +164,7 @@ BACKGROUND_MODEL_CANDIDATES = [
     item.strip()
     for item in os.getenv(
         "GEMINI_BACKGROUND_MODELS",
-        "gemini-2.5-flash,gemini-2.5-flash-lite",
+        "gemini-2.5-flash-lite",
     ).split(",")
     if item.strip()
 ]
@@ -684,7 +704,7 @@ Critical forbidden-list compliance:
 - Output `person_name` only as the canonical common public name you checked against the forbidden list. Do not use honorifics, titles, or alternate spellings.
 
 Round requirements:
-- Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable.
+[CATEGORY_RULE]
 - Never pick anyone from the forbidden list in the user prompt.
 - Theme the UI around what the person is most famous for. Example: Ozzy Osbourne can imply stage lighting, guitar shapes, tour-poster energy.
 - The guessing page must include:
@@ -744,7 +764,7 @@ Candidate rules:
 - Return exactly [CANDIDATE_COUNT] candidates.
 - Each candidate must include `person_name`.
 - Do not include `actual_status`; the backend verifies current vital status from Wikidata before the person can be used.
-- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable.
+[CATEGORY_RULE]
 - Never return anyone from the forbidden list in the user prompt.
 - Use canonical common public names only.
 - Do not include duplicate people, aliases of the same person, or close variants of the same name.
@@ -847,6 +867,7 @@ def build_generation_prompt(
     retry_notes: list[str] | None = None,
     locked_person_name: str | None = None,
     locked_actual_status: str | None = None,
+    category: str = "Random",
 ) -> str:
     if locked_person_name:
         forbidden_tail = (
@@ -885,6 +906,11 @@ def build_generation_prompt(
             )
 
     prompt_body = SYSTEM_PROMPT.replace("[NAMELIST]", forbidden_tail)
+    if category.lower() == "random":
+        cat_rule = "- Pick one famous person whose age would be between 8 and 120 years old whose status is genuinely guessable."
+    else:
+        cat_rule = f'- Pick one famous person from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
+    prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
     prompt_body = locked_section + prompt_body
     return f"{prompt_body}\n\n{retry_section}Return one complete round only."
 
@@ -892,6 +918,7 @@ def build_generation_prompt(
 def build_candidate_selection_prompt(
     forbidden: list[str],
     retry_notes: list[str] | None = None,
+    category: str = "Random",
 ) -> str:
     if forbidden:
         forbidden_tail = ", ".join(list(dict.fromkeys(forbidden)))
@@ -905,6 +932,11 @@ def build_candidate_selection_prompt(
             retry_section = "Retry notes:\n" + "\n".join(f"- {note}" for note in deduped_notes) + "\n\n"
 
     prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
+    if category.lower() == "random":
+        cat_rule = "- Pick famous people whose age would be between 8 and 120 years old whose status is genuinely guessable."
+    else:
+        cat_rule = f'- Pick famous people from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
+    prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
     return (
         "CRITICAL FORBIDDEN LIST:\n"
         f"[{forbidden_tail}]\n\n"
@@ -1168,10 +1200,7 @@ def validate_guess_button_layout(fragment: str, person_name: str) -> None:
         ancestor = guess_node
         depth = 0
         while ancestor.parent is not None:
-            # Check up to 3 ancestor levels (depth 0, 1, 2). Deeper nesting is
-            # considered unlikely to be intentional overlay positioning and is left
-            # undetected to avoid false positives on complex card layouts.
-            if depth <= 2 and node_uses_button_overlay_classes(ancestor):
+            if depth <= 1 and node_uses_button_overlay_classes(ancestor):
                 raise ValueError(
                     f"Guessing UI places guess buttons over the portrait for {person_name}: overlay positioning utilities detected"
                 )
@@ -1189,20 +1218,32 @@ def extract_wikimedia_thumbnail_width(image_source: str) -> str | None:
 
 
 def fetch_json_url(url: str, timeout_seconds: float, user_agent: str) -> dict:
-    request = UrlRequest(
-        url,
-        headers={
-            "User-Agent": user_agent,
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
-    with urlopen(request, timeout=timeout_seconds) as response:
-        status = getattr(response, "status", None) or response.getcode()
-        if status and status >= 400:
-            raise RuntimeError(f"HTTP {status}")
-        payload = response.read().decode("utf-8")
-    return json.loads(payload)
+    for attempt in range(3):
+        request = UrlRequest(
+            url,
+            headers={
+                "User-Agent": user_agent,
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                if status and status >= 400:
+                    if status == 429 and attempt < 2:
+                        import time
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise RuntimeError(f"HTTP {status}")
+                payload = response.read().decode("utf-8")
+            return json.loads(payload)
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                import time
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
 
 def validate_image_url_reachable(image_source: str, person_name: str, label: str) -> None:
@@ -1606,6 +1647,32 @@ def resolve_wikimedia_portrait_url(person_name: str, portrait_search_query: str)
     )
 
     try:
+        wikipedia_page_result = resolve_wikipedia_page_portrait_url(person_name)
+        if wikipedia_page_result is not None:
+            image_source, resolved_title = wikipedia_page_result
+            try:
+                validate_image_url_reachable(image_source, person_name, "Resolved portrait")
+                portrait_resolution_cache.set(cache_key, (True, image_source))
+                append_gemini_audit_log(
+                    "portrait.resolve",
+                    status="accepted",
+                    person_name=person_name,
+                    portrait_search_query=search_query,
+                    attempted_queries=["wikipedia_page_exact"],
+                    resolved_portrait_url=image_source,
+                    resolved_from_query="wikipedia_page_exact",
+                    resolved_title=resolved_title,
+                )
+                log_perf(
+                    "portrait.resolve",
+                    started_at,
+                    person_name=person_name,
+                    portrait_search_query=search_query,
+                    resolved_from_query="wikipedia_page_exact",
+                )
+                return image_source
+            except Exception:
+                pass
 
 
         for candidate_query in build_portrait_search_candidates(person_name, search_query):
@@ -1671,29 +1738,6 @@ def resolve_wikimedia_portrait_url(person_name: str, portrait_search_query: str)
                 )
                 return image_source
 
-        wikipedia_page_result = resolve_wikipedia_page_portrait_url(person_name)
-        if wikipedia_page_result is not None:
-            image_source, resolved_title = wikipedia_page_result
-            validate_image_url_reachable(image_source, person_name, "Resolved portrait")
-            portrait_resolution_cache.set(cache_key, (True, image_source))
-            append_gemini_audit_log(
-                "portrait.resolve",
-                status="accepted",
-                person_name=person_name,
-                portrait_search_query=search_query,
-                attempted_queries=["wikipedia_page_exact_or_search"] + attempted_queries,
-                resolved_portrait_url=image_source,
-                resolved_from_query="wikipedia_page_exact_or_search",
-                resolved_title=resolved_title,
-            )
-            log_perf(
-                "portrait.resolve",
-                started_at,
-                person_name=person_name,
-                portrait_search_query=search_query,
-                resolved_from_query="wikipedia_page_exact_or_search",
-            )
-            return image_source
     except Exception as exc:
         resolution_error = (
             f"{resolution_error} ({exc})"
@@ -2228,6 +2272,7 @@ def select_allowed_candidate_sync(
     model_candidates: list[str],
     retry_notes: list[str],
     audit_meta: dict[str, object],
+    category: str = "Random",
 ) -> tuple[str, LockedCandidate]:
     if (
         LOCAL_CANDIDATE_FIRST_HISTORY_SIZE > 0
@@ -2253,7 +2298,7 @@ def select_allowed_candidate_sync(
         except Exception as exc:
             logger.warning("Local verified candidate selection failed: %s", exc)
 
-    prompt = build_candidate_selection_prompt(forbidden, retry_notes)
+    prompt = build_candidate_selection_prompt(forbidden, retry_notes, category)
     errors: list[str] = []
 
     for model_name in model_candidates:
@@ -2290,6 +2335,7 @@ def generate_single_round_sync(
     forbidden: list[str],
     model_candidates: list[str],
     race_models: bool = False,
+    category: str = "Random",
 ) -> tuple[str, dict]:
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
@@ -2311,6 +2357,7 @@ def generate_single_round_sync(
                 model_candidates,
                 retry_notes,
                 audit_meta,
+                category=category,
             )
         except Exception as exc:
             errors.append(f"candidate selection attempt {attempt + 1}: {exc}")
@@ -2354,6 +2401,7 @@ def generate_single_round_sync(
             retry_notes,
             locked_person_name=locked_candidate.person_name,
             locked_actual_status=locked_candidate.actual_status,
+            category=category,
         )
 
         if race_models and len(model_candidates) > 1:
@@ -2501,6 +2549,7 @@ async def generate_round_payload(
         forbidden,
         model_candidates,
         race_models,
+        category=session.get("category", "Random")
     )
     session["used_names"] = merge_names_recency_preserving(
         session.get("used_names", []),
@@ -2541,7 +2590,7 @@ async def prefetch_next_rounds(session_id: str) -> None:
                 return
             if len(current_session["queued_rounds"]) >= PREFETCH_ROUND_BUFFER:
                 return
-            if current_session["round_number"] + len(current_session["queued_rounds"]) >= ROUNDS_PER_GAME:
+            if current_session.get("mode") == "classic" and current_session["round_number"] + len(current_session["queued_rounds"]) >= ROUNDS_PER_GAME:
                 return
 
             target_round_number = (
@@ -2575,7 +2624,7 @@ def schedule_prefetch(session_id: str) -> None:
     session = sessions.get(session_id)
     if not session:
         return
-    if session["round_number"] >= ROUNDS_PER_GAME:
+    if session.get("mode") == "classic" and session["round_number"] >= ROUNDS_PER_GAME:
         return
     if len(session.get("queued_rounds", [])) >= PREFETCH_ROUND_BUFFER:
         return
@@ -2707,6 +2756,7 @@ async def index():
         </style>
     </head>
     <body class="min-h-screen overflow-x-hidden">
+        
         <div id="app" class="mx-auto flex min-h-screen w-full max-w-7xl items-center justify-center px-4 py-8">
             <div class="grid w-full items-center gap-10 lg:grid-cols-[1.1fr_0.9fr]">
                 <div>
@@ -2721,16 +2771,37 @@ async def index():
                     <p class="mt-6 max-w-2xl text-lg leading-relaxed text-zinc-300 sm:text-xl">
                         Gemini designs each round on demand, then the backend resolves and verifies a matching Wikimedia portrait before the round is shown.
                     </p>
+                    
+                    <!-- New Game Options -->
+                    <div class="mt-8 grid gap-4 max-w-md">
+                        <div>
+                            <label class="block text-xs uppercase tracking-[0.2em] text-zinc-400 mb-2">Game Mode</label>
+                            <select id="mode-select" class="w-full rounded-xl border border-white/10 bg-zinc-900 px-4 py-3 text-white outline-none focus:border-amber-400">
+                                <option value="classic">Classic (10 Rounds)</option>
+                                <option value="survival">Infinite Survival (10s Timer)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs uppercase tracking-[0.2em] text-zinc-400 mb-2">Category</label>
+                            <div class="flex gap-2 mb-2">
+                                <button onclick="setCategory('Random')" class="cat-btn flex-1 rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Random</button>
+                                <button onclick="setCategory('80s Action Stars')" class="cat-btn flex-1 rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">80s Action</button>
+                                <button onclick="setCategory('Rock & Roll Legends')" class="cat-btn flex-1 rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Rockstars</button>
+                            </div>
+                            <input type="text" id="category-input" placeholder="Or type a custom category..." class="w-full rounded-xl border border-white/10 bg-zinc-900 px-4 py-3 text-white outline-none focus:border-amber-400" value="Random">
+                        </div>
+                    </div>
+
                     <div class="mt-8 flex flex-wrap items-center gap-4">
                         <button id="start-btn" onclick="startGame()" class="rounded-full bg-white px-12 py-5 text-lg font-black uppercase tracking-[0.24em] text-black transition hover:scale-105 active:scale-95">
                             Start Game
                         </button>
-                        <div class="rounded-full border border-white/10 bg-white/5 px-5 py-3 text-sm uppercase tracking-[0.28em] text-zinc-300">
-                            10 live rounds
-                        </div>
+                        <button onclick="showLeaderboard()" class="rounded-full border border-white/10 bg-white/5 px-5 py-3 text-sm uppercase tracking-[0.28em] text-zinc-300 hover:bg-white/10">
+                            Leaderboard
+                        </button>
                     </div>
                 </div>
-                <div class="relative">
+                <div class="relative hidden lg:block">
                     <div class="absolute inset-0 rotate-[-7deg] rounded-[2.75rem] bg-gradient-to-br from-amber-400/35 via-rose-500/20 to-sky-400/20 blur-3xl"></div>
                     <div class="relative overflow-hidden rounded-[2.5rem] border border-white/10 bg-zinc-950/80 p-6 shadow-2xl">
                         <div class="flex items-center justify-between">
@@ -2742,28 +2813,130 @@ async def index():
                                 <p class="text-xs uppercase tracking-[0.35em] text-zinc-400">Design brief</p>
                                 <p class="mt-3 text-2xl font-black uppercase tracking-tight">Poster-scale names. Tabloid tension. Verified Wikimedia portraits.</p>
                             </div>
-                            <div class="grid grid-cols-2 gap-4">
-                                <div class="rounded-[1.75rem] border border-amber-300/20 bg-amber-300/10 p-4">
-                                    <p class="text-xs uppercase tracking-[0.3em] text-amber-200">Guess</p>
-                                    <p class="mt-2 text-sm leading-relaxed text-zinc-200">Fresh AI-designed layout generated in real time.</p>
-                                </div>
-                                <div class="rounded-[1.75rem] border border-sky-300/20 bg-sky-300/10 p-4">
-                                    <p class="text-xs uppercase tracking-[0.3em] text-sky-200">Image</p>
-                                    <p class="mt-2 text-sm leading-relaxed text-zinc-200">Gemini suggests the portrait search query, then the backend resolves a live Wikimedia image URL.</p>
-                                </div>
-                            </div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
+
+        <!-- Leaderboard Modal -->
+        <div id="leaderboard-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <div class="w-full max-w-lg rounded-3xl border border-white/10 bg-zinc-900 p-8 shadow-2xl">
+                <h2 id="lb-title" class="text-3xl font-black uppercase text-white mb-6 text-center">Global Leaderboard</h2>
+                
+                <div id="lb-submit-section" class="hidden mb-8 border-b border-white/10 pb-8 text-center">
+                    <p class="text-rose-400 font-bold uppercase tracking-widest text-sm mb-2">Game Over</p>
+                    <p class="text-5xl font-black text-amber-300 mb-4" id="lb-score-display">12</p>
+                    <p class="text-zinc-400 mb-4">Enter 3 initials to save your survival streak!</p>
+                    <div class="flex justify-center gap-2">
+                        <input type="text" id="lb-initials" maxlength="3" class="w-24 text-center rounded-lg border border-white/20 bg-black py-3 text-2xl font-black text-white uppercase outline-none focus:border-amber-400">
+                        <button onclick="submitScore()" class="rounded-lg bg-amber-500 px-6 font-bold uppercase text-black hover:bg-amber-400">Submit</button>
+                    </div>
+                </div>
+
+                <div id="lb-list" class="flex flex-col gap-3">
+                    <p class="text-center text-zinc-500">Loading scores...</p>
+                </div>
+
+                <div class="mt-8 text-center">
+                    <button onclick="closeLeaderboard()" class="rounded-full border border-white/20 px-8 py-3 text-sm font-bold uppercase tracking-widest text-white hover:bg-white/10">Close</button>
+                </div>
+            </div>
+        </div>
+
         <script>
+
             let sessionId = null;
+            let sessionMode = 'classic';
+            let survivalTimer = null;
+            let isGameOver = false;
             const START_SESSION_URL = {json.dumps(start_session_url)};
             const NEXT_ROUND_URL = {json.dumps(next_round_url)};
             const GUESS_URL = {json.dumps(guess_url)};
 
+            function setCategory(cat) {{
+                document.getElementById('category-input').value = cat;
+            }}
+
+            function startSurvivalTimer() {{
+                clearTimeout(survivalTimer);
+                const oldBar = document.getElementById('survival-timer-bar');
+                if(oldBar) oldBar.remove();
+
+                if (sessionMode !== 'survival') return;
+
+                const barHtml = `
+                <div id="survival-timer-bar" style="position:fixed; top:0; left:0; height:8px; background:linear-gradient(90deg, #f59e0b, #ef4444); width:100%; transition: width 10s linear; z-index:9999;">
+                    <div style="position:absolute; right:10px; top:12px; color:#ef4444; font-weight:bold; font-size:1.5rem; text-transform:uppercase; animation: pulse 1s infinite;">Hurry! 10 Seconds!</div>
+                </div>`;
+                document.body.insertAdjacentHTML('beforeend', barHtml);
+                
+                setTimeout(() => {{
+                    const bar = document.getElementById('survival-timer-bar');
+                    if(bar) bar.style.width = '0%';
+                }}, 50);
+
+                survivalTimer = setTimeout(() => {{
+                    submitGuess('timeout');
+                }}, 10000);
+            }}
+
+            function stopSurvivalTimer() {{
+                clearTimeout(survivalTimer);
+                const bar = document.getElementById('survival-timer-bar');
+                if(bar) bar.remove();
+            }}
+
+            async function showLeaderboard(finalScore = null) {{
+                document.getElementById('leaderboard-modal').classList.remove('hidden');
+                document.getElementById('leaderboard-modal').classList.add('flex');
+                
+                const submitSection = document.getElementById('lb-submit-section');
+                if (finalScore !== null) {{
+                    submitSection.classList.remove('hidden');
+                    document.getElementById('lb-score-display').textContent = finalScore;
+                }} else {{
+                    submitSection.classList.add('hidden');
+                }}
+
+                try {{
+                    const res = await fetch('/api/leaderboard');
+                    const scores = await res.json();
+                    const list = document.getElementById('lb-list');
+                    list.innerHTML = scores.map((s, i) => `
+                        <div class="flex justify-between items-center bg-white/5 p-3 rounded-lg border border-white/5">
+                            <span class="font-black text-amber-500 w-8">#${{i+1}}</span>
+                            <span class="font-bold text-white text-xl tracking-widest">${{s.initials}}</span>
+                            <span class="font-black text-rose-400 text-xl">${{s.score}}</span>
+                        </div>
+                    `).join('');
+                }} catch(e) {{}}
+            }}
+
+            function closeLeaderboard() {{
+                document.getElementById('leaderboard-modal').classList.add('hidden');
+                document.getElementById('leaderboard-modal').classList.remove('flex');
+                if (typeof isGameOver !== 'undefined' && isGameOver) {{
+                    location.reload();
+                }} else if (!document.getElementById('lb-submit-section').classList.contains('hidden')) {{
+                    location.reload();
+                }}
+            }}
+
+            async function submitScore() {{
+                const initials = document.getElementById('lb-initials').value.toUpperCase() || 'ANON';
+                const score = parseInt(document.getElementById('lb-score-display').textContent);
+                await fetch('/api/leaderboard', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{ initials, score }})
+                }});
+                document.getElementById('lb-submit-section').classList.add('hidden');
+                showLeaderboard();
+            }}
+
             function renderLoader(title, detail) {{
+                stopSurvivalTimer();
                 document.getElementById('app').innerHTML = `
                     <div class="relative w-full max-w-4xl overflow-hidden rounded-[2.75rem] border border-white/10 bg-zinc-950/95 p-10 text-center shadow-2xl">
                         <div class="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-amber-300 via-rose-400 to-sky-400"></div>
@@ -2773,15 +2946,20 @@ async def index():
                         <p class="text-xs font-bold uppercase tracking-[0.42em] text-zinc-500">Live generation</p>
                         <h2 id="status-title" class="mt-4 text-3xl font-black uppercase tracking-[0.18em] md:text-4xl"></h2>
                         <p id="status-detail" class="mx-auto mt-5 max-w-2xl text-lg leading-relaxed text-zinc-400"></p>
-                        <button onclick="location.reload()" class="mt-8 rounded-full border border-white/15 px-6 py-3 text-sm font-bold uppercase tracking-[0.2em] text-zinc-200 transition hover:border-white/40 hover:text-white">
-                            Reload
-                        </button>
+                        <div id="loader-warning" class="mt-8 text-xl font-bold text-rose-500 uppercase tracking-widest animate-pulse hidden">
+                            ⚠️ GET READY: 10 SECONDS PER ROUND! ⚠️
+                        </div>
                     </div>`;
                 document.getElementById('status-title').textContent = title;
                 document.getElementById('status-detail').textContent = detail;
+                
+                if (typeof sessionMode !== 'undefined' && sessionMode === 'survival') {{
+                    document.getElementById('loader-warning').classList.remove('hidden');
+                }}
             }}
 
             function renderFatal(message) {{
+                stopSurvivalTimer();
                 document.getElementById('app').innerHTML = `
                     <div class="w-full max-w-3xl rounded-[2.75rem] border border-rose-500/30 bg-zinc-950/95 p-10 text-center shadow-2xl">
                         <p class="text-sm uppercase tracking-[0.45em] text-rose-300">Request Failed</p>
@@ -2795,13 +2973,20 @@ async def index():
             }}
 
             async function startGame() {{
+                sessionMode = document.getElementById('mode-select') ? document.getElementById('mode-select').value : 'classic';
+                const category = document.getElementById('category-input') ? document.getElementById('category-input').value : 'Random';
+
                 renderLoader(
                     'Designing Round One',
                     'Gemini is generating the first challenge in real time.'
                 );
 
                 try {{
-                    const response = await fetch(START_SESSION_URL, {{ method: 'POST' }});
+                    const response = await fetch(START_SESSION_URL, {{ 
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ mode: sessionMode, category: category }})
+                    }});
                     const data = await response.json();
                     if (!response.ok) {{
                         renderFatal(data.detail || 'Unable to start a new session.');
@@ -2809,6 +2994,7 @@ async def index():
                     }}
                     sessionId = data.session_id;
                     document.getElementById('app').innerHTML = data.guessing_ui_html;
+                    startSurvivalTimer();
                 }} catch (error) {{
                     renderFatal('Unable to start a new session.');
                 }}
@@ -2832,12 +3018,14 @@ async def index():
                         return;
                     }}
                     document.getElementById('app').innerHTML = data.guessing_ui_html;
+                    startSurvivalTimer();
                 }} catch (error) {{
                     renderFatal('The next round failed to load.');
                 }}
             }}
 
             async function submitGuess(guess) {{
+                stopSurvivalTimer();
                 try {{
                     const response = await fetch(GUESS_URL, {{
                         method: 'POST',
@@ -2850,6 +3038,16 @@ async def index():
                         return;
                     }}
                     document.getElementById('app').innerHTML = data.reveal_ui_html;
+
+                    if (data.game_over && sessionMode === 'survival') {{
+                        isGameOver = true;
+                        const nextBtn = document.querySelector('button[onclick*="showLeaderboard"], button[onclick*="loadNextRound"]');
+                        if (nextBtn) nextBtn.style.display = 'none';
+                        // Disable the loadNextRound button injected by Gemini
+                        setTimeout(() => {{
+                            showLeaderboard(data.score);
+                        }}, 2500);
+                    }}
                 }} catch (error) {{
                     renderFatal('The guess request failed.');
                 }}
@@ -2877,7 +3075,12 @@ async def status():
 
 
 @app.post("/api/start-session")
-async def start_session():
+async def start_session(request: FastAPIRequest):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    
     session_id = str(uuid.uuid4())
     session = {
         "score": 0,
@@ -2888,8 +3091,10 @@ async def start_session():
         "queued_rounds": [],
         "prefetch_task": None,
         "prefetch_error": None,
-        "created_at": time.monotonic(),   # used by session cleanup TTL
-        "round_lock": asyncio.Lock(),      # serialises queued_rounds access
+        "created_at": time.monotonic(),
+        "round_lock": asyncio.Lock(),
+        "mode": data.get("mode", "classic"),
+        "category": data.get("category", "Random"),
     }
     sessions[session_id] = session
 
@@ -2924,8 +3129,11 @@ async def next_round(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
-    if session["round_number"] >= ROUNDS_PER_GAME:
+    if session.get("mode") == "classic" and session["round_number"] >= ROUNDS_PER_GAME:
         return {"status": "finale", "finale_html": render_finale_html(session)}
+        
+    if session.get("mode") == "survival" and session["history"] and not session["history"][-1]["correct"]:
+        raise HTTPException(status_code=400, detail="Game Over. You cannot continue in survival mode after an incorrect guess.")
 
     try:
         round_data = await get_next_round_for_session(session_id, session)
@@ -2942,6 +3150,32 @@ async def next_round(session_id: str):
     return {"status": "playing", "guessing_ui_html": round_data["guessing_ui_html"]}
 
 
+
+@app.get("/api/leaderboard")
+async def get_leaderboard():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT initials, score, timestamp FROM leaderboard ORDER BY score DESC LIMIT 10")
+    rows = c.fetchall()
+    conn.close()
+    return [{"initials": r[0], "score": r[1], "date": r[2]} for r in rows]
+
+class LeaderboardSubmit(BaseModel):
+    initials: str
+    score: int
+
+@app.post("/api/leaderboard")
+async def post_leaderboard(submission: LeaderboardSubmit):
+    if len(submission.initials) > 10:
+        submission.initials = submission.initials[:10]
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO leaderboard (initials, score) VALUES (?, ?)", (submission.initials, submission.score))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
 @app.post("/api/guess")
 async def guess(request: FastAPIRequest):
     data = await request.json()
@@ -2950,8 +3184,8 @@ async def guess(request: FastAPIRequest):
 
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    if user_guess not in {"alive", "dead"}:
-        raise HTTPException(status_code=400, detail="Guess must be 'alive' or 'dead'")
+    if user_guess not in {"alive", "dead", "timeout"}:
+        raise HTTPException(status_code=400, detail="Guess must be 'alive', 'dead', or 'timeout'")
 
     session = sessions[session_id]
     round_data = session.get("active_round")
@@ -2970,8 +3204,13 @@ async def guess(request: FastAPIRequest):
         }
     )
 
-    color = "text-emerald-400" if is_correct else "text-rose-400"
-    text = "CORRECT" if is_correct else "INCORRECT"
+    if user_guess == "timeout":
+        color = "text-amber-500"
+        text = "OUT OF TIME"
+    else:
+        color = "text-emerald-400" if is_correct else "text-rose-400"
+        text = "CORRECT" if is_correct else "INCORRECT"
+        
     injection = (
         "<div class='pointer-events-none fixed left-0 right-0 top-8 z-50 flex justify-center'>"
         "<div class='rounded-full border border-white/10 bg-black/90 px-8 py-3 shadow-2xl'>"
@@ -2979,7 +3218,23 @@ async def guess(request: FastAPIRequest):
         "</div>"
         "</div>"
     )
-    return {"reveal_ui_html": injection + round_data["reveal_ui_html"]}
+    
+    game_over = False
+    if session.get("mode") == "survival" and not is_correct:
+        game_over = True
+    elif session.get("mode") == "classic" and session.get("round_number", 0) >= ROUNDS_PER_GAME:
+        game_over = True
+        
+    reveal_html = injection + round_data["reveal_ui_html"]
+    if game_over:
+        reveal_html = reveal_html.replace('onclick="loadNextRound()"', 'onclick="showLeaderboard(' + str(session['score']) + ')"')
+        reveal_html = reveal_html.replace("loadNextRound()", "showLeaderboard(" + str(session['score']) + ")")
+        
+    return {
+        "reveal_ui_html": reveal_html,
+        "game_over": game_over,
+        "score": session["score"]
+    }
 
 
 if __name__ == "__main__":
