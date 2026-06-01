@@ -715,6 +715,7 @@ Round requirements:
   - `submitGuess('alive')` and `submitGuess('dead')` buttons
 - The reveal page must match the same theme and include `loadNextRound()`.
 - When stating the person's status on the reveal page, ALWAYS use present tense for living people (e.g. "is alive", NEVER "was alive").
+- If the person is dead, the reveal page MUST explicitly state the full date of their death (e.g., "Died on March 14, 2018").
 - The person cannot be one of these formerly selected people: [NAMELIST]
 
 Output rules:
