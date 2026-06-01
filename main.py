@@ -710,7 +710,7 @@ Round requirements:
 - Theme the UI around what the person is most famous for. Example: Ozzy Osbourne can imply stage lighting, guitar shapes, tour-poster energy.
 - The guessing page must include:
   - the person's name as the biggest text
-  - one short status-neutral description of what they are most famous for
+  - one highly detailed, status-neutral description of what they are most famous for (you MUST explicitly list out their specific famous movies, TV shows, songs, books, awards, or major career achievements, e.g., "Famous for starring in Forrest Gump, Cast Away, and Toy Story")
   - one short status-neutral fun fact
   - exactly one portrait `<img>` whose `src` is the exact literal `__PORTRAIT_IMAGE_URL__`
   - `submitGuess('alive')` and `submitGuess('dead')` buttons
@@ -724,7 +724,7 @@ Output rules:
 - You MAY use raw <svg> tags directly in the HTML for icons, abstract background shapes, and thematic decorations. Do not use SVG data URIs.
 - Do not output any final remote image URL anywhere in the JSON. The backend will resolve the portrait URL from `portrait_search_query`.
 - `portrait_search_query` must be plain text, not a URL, and should be a concise Wikimedia Commons portrait search phrase.
-- To avoid giving away their current age/status, `portrait_search_query` MUST append the specific year or decade of their peak fame (e.g., `Kevin Bacon 1984` or `Sean Connery 1960s`). Do NOT use movie titles, as Wikimedia Commons lacks copyrighted movie stills.
+- To avoid giving away their current age/status, `portrait_search_query` MUST append the specific year or decade of their peak fame, AND you must include their profession or known title to avoid name collisions (e.g., `Bob Ross painter 1980s` or `Sean Connery actor 1960s`). Do NOT use movie titles, as Wikimedia Commons lacks copyrighted movie stills.
 - Prefer portrait, headshot, publicity photo, or press photo wording when useful.
 - Do not include site names like `wikipedia`, `wikimedia`, or `commons` in `portrait_search_query`; the backend already searches Wikimedia Commons.
 - If you are not confident you can suggest a clean portrait query, choose a different person instead of guessing.
@@ -911,7 +911,7 @@ def build_generation_prompt(
     prompt_body = SYSTEM_PROMPT.replace("[NAMELIST]", forbidden_tail)
     if category.lower() == "random":
         domain = random.choice(["science", "literature", "politics", "music", "cinema", "sports", "technology", "art", "business", "activism", "television", "comedy", "journalism", "fashion", "culinary arts", "athletics", "engineering"])
-        cat_rule = f"- Pick one famous person who was born between 1904 and 2016 (their current age would be between 8 and 120 years old). To ensure variety, randomly pick someone known for {domain} from a different global region than the obvious A-list celebrities. DO NOT PICK ANCIENT HISTORICAL FIGURES."
+        cat_rule = f"- Pick one globally recognizable, well-known famous person who was born between 1904 and 2016 (their current age would be between 8 and 120 years old). Pick someone famous for {domain}. DO NOT PICK ANCIENT HISTORICAL FIGURES."
     else:
         cat_rule = f'- Pick one famous person from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
     prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
@@ -938,7 +938,7 @@ def build_candidate_selection_prompt(
     prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
     if category.lower() == "random":
         domain = random.choice(["science", "literature", "politics", "music", "cinema", "sports", "technology", "art", "business", "activism", "television", "comedy", "journalism", "fashion", "culinary arts", "athletics", "engineering"])
-        cat_rule = f"- Pick famous people who were born between 1904 and 2016 (their current age would be between 8 and 120 years old). DO NOT pick the most obvious A-list actors; instead pick people known for {domain} or similar fields. DO NOT PICK ANCIENT HISTORICAL FIGURES."
+        cat_rule = f"- Pick highly well-known, universally recognizable famous people who were born between 1904 and 2016 (their current age would be between 8 and 120 years old). Pick people famous for {domain}. DO NOT PICK ANCIENT HISTORICAL FIGURES."
     else:
         cat_rule = f'- Pick famous people from the category "{category}" whose age would be between 8 and 120 years old whose status is genuinely guessable.'
     prompt_body = prompt_body.replace("[CATEGORY_RULE]", cat_rule)
@@ -3098,7 +3098,7 @@ async def start_session(request: FastAPIRequest):
         "prefetch_error": None,
         "created_at": time.monotonic(),
         "round_lock": asyncio.Lock(),
-        "mode": data.get("mode", "survival"),
+        "mode": data.get("game_mode", "survival"),
         "category": data.get("category", "Random"),
     }
     sessions[session_id] = session
@@ -3227,8 +3227,10 @@ async def guess(request: FastAPIRequest):
     game_over = False
     if session.get("mode") == "survival" and not is_correct:
         game_over = True
+        logger.info(f"Game over survival: is_correct={is_correct}")
     elif session.get("mode") == "classic" and session.get("round_number", 0) >= ROUNDS_PER_GAME:
         game_over = True
+        logger.info(f"Game over classic: round_number={session.get('round_number')} >= {ROUNDS_PER_GAME}")
         
     reveal_html = injection + round_data["reveal_ui_html"]
     if game_over:
@@ -3238,7 +3240,8 @@ async def guess(request: FastAPIRequest):
     return {
         "reveal_ui_html": reveal_html,
         "game_over": game_over,
-        "score": session["score"]
+        "score": session["score"],
+        "correct": is_correct
     }
 
 
