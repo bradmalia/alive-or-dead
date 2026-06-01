@@ -2,38 +2,69 @@
 
 This is a Proof of Concept for the "Alive or Dead" game, featuring an AI-driven game loop and dynamic UI generation. Gemini returns the round JSON and HTML fragments directly, while the backend verifies current vital status through Wikidata and resolves a portrait search query into a verified Wikimedia image URL.
 
-## Project Structure
+## 🚀 How to Launch the Game
 
-- `main.py`: The FastAPI server containing the game logic and the AI System Prompt.
-- `requirements.txt`: Python dependencies.
+There are two primary ways to run the application: **Local Development** or **Production Deployment**.
 
-## How to Run
+### 💻 1. Local Development (Recommended for Testing)
+
+This method runs the FastAPI server directly on your machine.
 
 1. **Install Dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **Run the Server**:
+2. **Set Environment Variables**:
+   Create a `.env` file in the project root and populate it with your API keys and configuration settings:
+   ```env
+   # Required API Key
+   GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+   
+   # Optional: Set the base path if running in a subdirectory
+   # APP_BASE_PATH="/alive-or-dead"
+   ```
+
+3. **Run the Server**:
    ```bash
    python main.py
    ```
 
-3. **Access the Game**:
+4. **Access the Game**:
    Open your browser and navigate to `http://localhost:8000`.
 
-## Apache + systemd deployment
+---
 
-The repository includes deployment templates for serving the app behind Apache at `/alive-or-dead`:
+### ⚙️ 2. Production Deployment (Using Docker/Systemd)
 
-- `deploy/alive-or-dead.service`: `systemd` unit running Uvicorn on `127.0.0.1:8000`
-- `deploy/alive-or-dead-apache.conf`: Apache proxy snippet for `/alive-or-dead/`
+For a live, persistent deployment, the repository includes templates for Apache and systemd.
 
-The service expects:
+**Prerequisites:**
+*   A Linux server (e.g., Ubuntu).
+*   Apache web server installed.
+*   Python 3.12 and `pip`.
+*   SSH access with necessary permissions.
 
-- project path: `/home/ubuntu/alive-or-dead`
-- environment file: `/home/ubuntu/alive-or-dead/.env`
-- app base path: `APP_BASE_PATH=/alive-or-dead`
+**Deployment Steps:**
+
+1. **Sync Code:** Use `rsync` to pull the latest code to the target directory (`/home/ubuntu/alive-or-dead`).
+2. **Install Dependencies:** Run the deployment script to set up the virtual environment and install requirements.
+    ```bash
+    # Assuming you are in the repository root
+    bash deploy/remote_deploy.sh
+    ```
+3. **Verify Services:** The script handles installing the Apache configuration (`/etc/apache2/conf-available/alive-or-dead.conf`) and the `systemd` service file (`/etc/systemd/system/alive-or-dead.service`).
+4. **Restart Services:** The script will reload Apache and restart the service to ensure the new code is running.
+
+---
+
+## 📂 Project Structure
+
+- `main.py`: The FastAPI server containing the game logic and the AI System Prompt.
+- `requirements.txt`: Python dependencies.
+- `deploy/alive-or-dead-apache.conf`: Apache proxy snippet for `/alive-or-dead/`.
+- `deploy/alive-or-dead.service`: `systemd` unit running Uvicorn on `127.0.0.1:8000`.
+- `deploy/remote_deploy.sh`: Script to automate deployment setup.
 
 ## GitHub Actions deploy
 
