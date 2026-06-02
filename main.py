@@ -877,7 +877,7 @@ def build_generation_prompt(
     retry_notes: list[str] | None = None,
     locked_person_name: str | None = None,
     locked_actual_status: str | None = None,
-    category: str = "Random",
+    category: str = "All Celebrities",
 ) -> str:
     if locked_person_name:
         forbidden_tail = (
@@ -916,7 +916,7 @@ def build_generation_prompt(
             )
 
     prompt_body = SYSTEM_PROMPT.replace("[NAMELIST]", forbidden_tail)
-    if category.lower() == "random":
+    if category.casefold() in ("random", "all celebrities"):
         domain = random.choice(["science", "literature", "politics", "music", "cinema", "sports", "technology", "art", "business", "activism", "television", "comedy", "journalism", "fashion", "culinary arts", "athletics", "engineering"])
         cat_rule = f"- Pick one globally recognizable, well-known famous person who was born between 1904 and 2016 (their current age would be between 8 and 120 years old). Pick someone famous for {domain}. DO NOT PICK ANCIENT HISTORICAL FIGURES."
     else:
@@ -929,7 +929,7 @@ def build_generation_prompt(
 def build_candidate_selection_prompt(
     forbidden: list[str],
     retry_notes: list[str] | None = None,
-    category: str = "Random",
+    category: str = "All Celebrities",
 ) -> str:
     if forbidden:
         forbidden_tail = ", ".join(list(dict.fromkeys(forbidden)))
@@ -943,7 +943,7 @@ def build_candidate_selection_prompt(
             retry_section = "Retry notes:\n" + "\n".join(f"- {note}" for note in deduped_notes) + "\n\n"
 
     prompt_body = CANDIDATE_SELECTION_PROMPT.replace("[CANDIDATE_COUNT]", str(CANDIDATE_SELECTION_COUNT))
-    if category.lower() == "random":
+    if category.casefold() in ("random", "all celebrities"):
         domain = random.choice(["science", "literature", "politics", "music", "cinema", "sports", "technology", "art", "business", "activism", "television", "comedy", "journalism", "fashion", "culinary arts", "athletics", "engineering"])
         cat_rule = f"- Pick highly well-known, universally recognizable famous people who were born between 1904 and 2016 (their current age would be between 8 and 120 years old). Pick people famous for {domain}. DO NOT PICK ANCIENT HISTORICAL FIGURES."
     else:
@@ -2285,7 +2285,7 @@ def select_allowed_candidate_sync(
     model_candidates: list[str],
     retry_notes: list[str],
     audit_meta: dict[str, object],
-    category: str = "Random",
+    category: str = "All Celebrities",
 ) -> tuple[str, LockedCandidate]:
     if (
         LOCAL_CANDIDATE_FIRST_HISTORY_SIZE > 0
@@ -2348,7 +2348,7 @@ def generate_single_round_sync(
     forbidden: list[str],
     model_candidates: list[str],
     race_models: bool = False,
-    category: str = "Random",
+    category: str = "All Celebrities",
 ) -> tuple[str, dict]:
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
@@ -2574,7 +2574,7 @@ async def generate_round_payload(
         forbidden,
         model_candidates,
         race_models,
-        category=session.get("category", "Random")
+        category=session.get("category", "All Celebrities")
     )
     session["used_names"] = merge_names_recency_preserving(
         session.get("used_names", []),
@@ -2817,14 +2817,14 @@ async def index():
                             <label class="block text-xs uppercase tracking-[0.2em] text-zinc-400 mb-2">Category</label>
                             <p class="text-sm text-zinc-500 mb-3">Choose a preselected category or enter your own below:</p>
                             <div class="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-3">
-                                <button onclick="setCategory('Random')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Random</button>
-                                <button onclick="setCategory('80s Action Stars')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">80s Action</button>
+                                <button onclick="setCategory('All Celebrities')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">All Celebs</button>
+                                <button onclick="setCategory('TV and Movies')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">TV & Movies</button>
                                 <button onclick="setCategory('Rock & Roll Legends')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Rockstars</button>
                                 <button onclick="setCategory('Legendary Comedians')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Comedians</button>
                                 <button onclick="setCategory('Historical Figures')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Historical</button>
                                 <button onclick="setCategory('Sports Legends')" class="cat-btn rounded-lg border border-white/10 bg-white/5 py-2 text-xs uppercase text-zinc-300 hover:bg-white/10">Sports</button>
                             </div>
-                            <input type="text" id="category-input" placeholder="Or type a custom category..." class="w-full rounded-xl border border-white/10 bg-zinc-900 px-4 py-3 text-white outline-none focus:border-amber-400" value="Random">
+                            <input type="text" id="category-input" placeholder="Or type a custom category..." class="w-full rounded-xl border border-white/10 bg-zinc-900 px-4 py-3 text-white outline-none focus:border-amber-400" value="All Celebrities">
                         </div>
                     </div>
 
@@ -2999,7 +2999,7 @@ async def index():
 
             async function startGame() {{
                 sessionMode = document.getElementById('mode-select') ? document.getElementById('mode-select').value : 'survival';
-                const category = document.getElementById('category-input') ? document.getElementById('category-input').value : 'Random';
+                const category = document.getElementById('category-input') ? document.getElementById('category-input').value : 'All Celebrities';
 
                 renderLoader(
                     'Designing Round One',
@@ -3119,7 +3119,7 @@ async def start_session(request: FastAPIRequest):
         "created_at": time.monotonic(),
         "round_lock": asyncio.Lock(),
         "mode": data.get("mode", "survival"),
-        "category": data.get("category", "Random"),
+        "category": data.get("category", "All Celebrities"),
     }
     sessions[session_id] = session
 
