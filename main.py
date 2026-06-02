@@ -2755,6 +2755,7 @@ async def index():
     start_session_url = app_path("/api/start-session")
     next_round_url = app_path("/api/next-round")
     guess_url = app_path("/api/guess")
+    leaderboard_url = app_path("/api/leaderboard")
     return f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -2878,6 +2879,7 @@ async def index():
             const START_SESSION_URL = {json.dumps(start_session_url)};
             const NEXT_ROUND_URL = {json.dumps(next_round_url)};
             const GUESS_URL = {json.dumps(guess_url)};
+            const LEADERBOARD_URL = {json.dumps(leaderboard_url)};
 
             function setCategory(cat) {{
                 document.getElementById('category-input').value = cat;
@@ -2925,7 +2927,7 @@ async def index():
                 }}
 
                 try {{
-                    const res = await fetch('/api/leaderboard');
+                    const res = await fetch(LEADERBOARD_URL);
                     const scores = await res.json();
                     const list = document.getElementById('lb-list');
                     list.innerHTML = scores.map((s, i) => `
@@ -2951,7 +2953,7 @@ async def index():
             async function submitScore() {{
                 const initials = document.getElementById('lb-initials').value.toUpperCase() || 'ANON';
                 const score = parseInt(document.getElementById('lb-score-display').textContent);
-                await fetch('/api/leaderboard', {{
+                await fetch(LEADERBOARD_URL, {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{ initials, score }})
