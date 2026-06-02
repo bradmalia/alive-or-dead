@@ -35,6 +35,13 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request as UrlRequest, urlopen
+import socket
+
+# Patch socket.getaddrinfo to force IPv4 and prevent AWS IPv6 blackhole timeouts
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
