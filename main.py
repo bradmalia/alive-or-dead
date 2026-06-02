@@ -113,7 +113,7 @@ CORS_ALLOWED_ORIGINS: list[str] = (
     else ["*"]
 )
 ROUNDS_PER_GAME = 10
-GLOBAL_HISTORY_PROMPT_LIMIT = int(os.getenv("GLOBAL_HISTORY_PROMPT_LIMIT", "500"))
+GLOBAL_HISTORY_PROMPT_LIMIT = int(os.getenv("GLOBAL_HISTORY_PROMPT_LIMIT", "50"))
 ROUND_GENERATION_ATTEMPTS = int(os.getenv("ROUND_GENERATION_ATTEMPTS", "3"))
 PREFETCH_ROUND_BUFFER = int(os.getenv("PREFETCH_ROUND_BUFFER", "2"))
 CANDIDATE_SELECTION_COUNT = min(
@@ -1113,7 +1113,8 @@ def validate_portrait_search_query(person_name: str, portrait_search_query: str)
 
 
 def normalize_name_key(name: str) -> str:
-    return " ".join(str(name).split()).casefold()
+    cleaned = "".join(c for c in str(name) if c.isalnum() or c.isspace())
+    return " ".join(cleaned.split()).casefold()
 
 
 def validate_status_neutral_guessing_copy(fragment: str, person_name: str) -> None:
@@ -2499,6 +2500,18 @@ def render_history_item(entry: dict) -> str:
         f"</div>"
     )
 
+def inject_round_number(html_str: str, round_num: int, mode: str) -> str:
+    mode_display = str(mode).capitalize()
+    injection = (
+        f"<div class='pointer-events-none fixed left-4 top-4 z-[60] flex'>"
+        f"<div class='rounded-full border border-white/20 bg-black/50 backdrop-blur-md px-5 py-2 shadow-2xl'>"
+        f"<span class='text-sm font-bold uppercase tracking-widest text-white/90'>{mode_display} &bull; Round {round_num}</span>"
+        f"</div>"
+        f"</div>"
+    )
+    return injection + html_str
+
+
 
 def render_finale_html(session: dict) -> str:
     score_val = int(session.get("score", 0))
@@ -3098,7 +3111,7 @@ async def start_session(request: FastAPIRequest):
         "prefetch_error": None,
         "created_at": time.monotonic(),
         "round_lock": asyncio.Lock(),
-        "mode": data.get("game_mode", "survival"),
+        "mode": data.get("mode", "survival"),
         "category": data.get("category", "Random"),
     }
     sessions[session_id] = session
@@ -3124,7 +3137,11 @@ async def start_session(request: FastAPIRequest):
     return {
         "session_id": session_id,
         "status": "ready",
-        "guessing_ui_html": round_data["guessing_ui_html"],
+        "guessing_ui_html": inject_round_number(
+            round_data["guessing_ui_html"], 
+            session["round_number"], 
+            session.get("mode", "survival")
+        ),
     }
 
 
@@ -3152,7 +3169,14 @@ async def next_round(session_id: str):
 
     session["round_number"] += 1
     schedule_prefetch(session_id)
-    return {"status": "playing", "guessing_ui_html": round_data["guessing_ui_html"]}
+    return {
+        "status": "playing", 
+        "guessing_ui_html": inject_round_number(
+            round_data["guessing_ui_html"], 
+            session["round_number"], 
+            session.get("mode", "survival")
+        )
+    }
 
 
 
@@ -3228,11 +3252,12 @@ async def guess(request: FastAPIRequest):
     if session.get("mode") == "survival" and not is_correct:
         game_over = True
         logger.info(f"Game over survival: is_correct={is_correct}")
-    elif session.get("mode") == "classic" and session.get("round_number", 0) >= ROUNDS_PER_GAME:
-        game_over = True
-        logger.info(f"Game over classic: round_number={session.get('round_number')} >= {ROUNDS_PER_GAME}")
-        
     reveal_html = injection + round_data["reveal_ui_html"]
+    reveal_html = inject_round_number(
+        reveal_html, 
+        session.get("round_number", 0), 
+        session.get("mode", "survival")
+    )
     if game_over:
         reveal_html = reveal_html.replace('onclick="loadNextRound()"', 'onclick="showLeaderboard(' + str(session['score']) + ')"')
         reveal_html = reveal_html.replace("loadNextRound()", "showLeaderboard(" + str(session['score']) + ")")
