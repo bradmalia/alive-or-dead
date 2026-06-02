@@ -754,6 +754,7 @@ Output rules:
 - You MUST use standard Tailwind animations (e.g. animate-pulse, animate-bounce, animate-spin) or arbitrary animation values to make the page dynamic and alive.
 - DO NOT use `<style>` tags, custom CSS blocks, or `@keyframes`. All styling and animation must be done via inline Tailwind classes.
 - Use massive typography, complex asymmetrical grid/flex layouts, intense gradients, deep drop-shadows, and glassmorphism (backdrop-blur).
+- CRITICAL READABILITY RULE: ALWAYS constrain text paragraphs and descriptions to a maximum width (e.g., `max-w-2xl` or `max-w-3xl`) and center or pad them appropriately so lines of text don't stretch across the entire ultra-wide window.
 - Keep each HTML fragment under 4000 characters. Be ambitious with the DOM complexity.
 - Keep button text high contrast.
 
