@@ -62,13 +62,16 @@ jobs:
         run: |
           curl --fail --silent --show-error --location \
             --retry 5 --retry-delay 5 --retry-connrefused \
-            "$PUBLIC_BASE_URL/" | grep -q "Projects by Brad Malia"
+            "$PUBLIC_BASE_URL/" | grep -q "Projects by Brad Malia" || (ssh -i ~/.ssh/id_ed25519 "$DEPLOY_USER@$DEPLOY_HOST" "journalctl -u alive-or-dead -n 100" && exit 1)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
 
       - name: Health check game status API
         run: |
           status_json="$(curl --fail --silent --show-error --location \
             --retry 5 --retry-delay 5 --retry-connrefused \
-            "$PUBLIC_BASE_URL/alive-or-dead/api/status")"
+            "$PUBLIC_BASE_URL/alive-or-dead/api/status")" || (ssh -i ~/.ssh/id_ed25519 "$DEPLOY_USER@$DEPLOY_HOST" "journalctl -u alive-or-dead -n 100" && exit 1)
           STATUS_JSON="$status_json" python - <<'PY'
           import json
           import os
@@ -77,3 +80,6 @@ jobs:
           assert data["image_contract"] == "backend_wikimedia_query_resolution"
           assert data["gemini_audit_log_enabled"] is True
           PY
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}

@@ -9,7 +9,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/alive-or-dead
 Environment=APP_BASE_PATH=/alive-or-dead
 EnvironmentFile=/home/ubuntu/alive-or-dead/.env
-ExecStart=/home/ubuntu/alive-or-dead/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8001 --proxy-headers --forwarded-allow-ips=127.0.0.1
+ExecStart=/home/ubuntu/alive-or-dead/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=always
 RestartSec=3
 
