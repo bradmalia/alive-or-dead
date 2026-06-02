@@ -755,6 +755,7 @@ Output rules:
 - DO NOT use `<style>` tags, custom CSS blocks, or `@keyframes`. All styling and animation must be done via inline Tailwind classes.
 - Use massive typography, complex asymmetrical grid/flex layouts, intense gradients, deep drop-shadows, and glassmorphism (backdrop-blur).
 - CRITICAL READABILITY RULE: ALWAYS constrain text paragraphs and descriptions to a maximum width (e.g., `max-w-2xl` or `max-w-3xl`) and center or pad them appropriately so lines of text don't stretch across the entire ultra-wide window.
+- CRITICAL RESPONSIVENESS RULE: All layouts MUST be mobile-friendly. Use Tailwind responsive prefixes (e.g., `flex-col md:flex-row`, `text-4xl md:text-7xl`, `p-4 md:p-8`) so that typography, layouts, and images scale gracefully on small mobile screens. Avoid fixed massive widths.
 - Keep each HTML fragment under 4000 characters. Be ambitious with the DOM complexity.
 - Keep button text high contrast.
 
