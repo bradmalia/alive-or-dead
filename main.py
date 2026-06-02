@@ -748,6 +748,8 @@ Output rules:
 - CRITICAL DESIGN RULE: You MUST create incredibly striking, highly stylized, and visually dramatic UI themes.
 - DO NOT use simple centered white cards or generic layouts.
 - You MUST use inline <svg> tags to draw large, abstract thematic background elements (like diagonal slashes, geometric patterns, or thematic icons) using absolute positioning behind the content.
+- Any absolute background SVGs MUST include the `-z-10` and `pointer-events-none` classes so they stay fully behind the content and do not steal pointer events.
+- CRITICAL CLICKABILITY RULE: You MUST wrap the guess buttons and the next round buttons in a `<div class="relative z-50">` container to guarantee they are always clickable.
 - NEVER use `data:image` or base64 data URIs inside your SVGs or anywhere else.
 - You MUST use standard Tailwind animations (e.g. animate-pulse, animate-bounce, animate-spin) or arbitrary animation values to make the page dynamic and alive.
 - DO NOT use `<style>` tags, custom CSS blocks, or `@keyframes`. All styling and animation must be done via inline Tailwind classes.
