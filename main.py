@@ -2625,12 +2625,17 @@ async def prefetch_next_rounds(session_id: str) -> None:
             target_round_number = (
                 current_session["round_number"] + len(current_session["queued_rounds"]) + 1
             )
-            _, round_data = await generate_round_payload(
-                current_session,
-                target_round_number,
-                BACKGROUND_MODEL_CANDIDATES,
-                False,
-            )
+            try:
+                _, round_data = await generate_round_payload(
+                    current_session,
+                    target_round_number,
+                    BACKGROUND_MODEL_CANDIDATES,
+                    False,
+                )
+            except Exception as e:
+                logger.warning("Prefetch payload generation failed for session %s round %s, retrying: %s", session_id, target_round_number, e)
+                await asyncio.sleep(2)
+                continue
             current_session = sessions.get(session_id)
             if current_session is None:
                 return
