@@ -2513,10 +2513,12 @@ def render_history_item(entry: dict) -> str:
 
 def inject_round_number(html_str: str, round_num: int, mode: str) -> str:
     mode_display = str(mode).capitalize()
+    short_mode = mode_display[0]
     injection = (
-        f"<div class='pointer-events-none fixed left-4 top-4 z-[60] flex'>"
-        f"<div class='rounded-full border border-white/20 bg-black/50 backdrop-blur-md px-5 py-2 shadow-2xl'>"
-        f"<span class='text-sm font-bold uppercase tracking-widest text-white/90'>{mode_display} &bull; Round {round_num}</span>"
+        f"<div class='pointer-events-none fixed left-2 top-3 sm:left-4 sm:top-4 z-[60] flex'>"
+        f"<div class='rounded-full border border-white/20 bg-black/60 backdrop-blur-md px-3 py-1.5 sm:px-5 sm:py-2 shadow-2xl'>"
+        f"<span class='hidden sm:inline text-sm font-bold uppercase tracking-widest text-white/90'>{mode_display} &bull; Round {round_num}</span>"
+        f"<span class='sm:hidden text-[10px] font-bold uppercase tracking-widest text-white/90'>{short_mode} &bull; R{round_num}</span>"
         f"</div>"
         f"</div>"
     )
@@ -2902,8 +2904,10 @@ async def index():
                 if (sessionMode !== 'survival') return;
 
                 const barHtml = `
-                <div id="survival-timer-bar" style="position:fixed; top:0; left:0; height:8px; background:linear-gradient(90deg, #f59e0b, #ef4444); width:100%; transition: width 10s linear; z-index:9999;">
-                    <div style="position:absolute; right:10px; top:12px; color:#ef4444; font-weight:bold; font-size:1.5rem; text-transform:uppercase; animation: pulse 1s infinite;">Hurry! 10 Seconds!</div>
+                <div id="survival-timer-bar" class="fixed top-0 left-0 w-full h-1.5 sm:h-2 z-[9999] pointer-events-none" style="background:linear-gradient(90deg, #f59e0b, #ef4444); transition: width 10s linear;">
+                    <div class="absolute right-2 top-2.5 sm:right-4 sm:top-4 text-rose-500 font-black text-[10px] sm:text-xl uppercase tracking-widest animate-pulse">
+                        <span class="hidden sm:inline">Hurry! </span>10s Left
+                    </div>
                 </div>`;
                 document.body.insertAdjacentHTML('beforeend', barHtml);
                 
