@@ -3117,6 +3117,15 @@ async def start_session(request: FastAPIRequest):
     except Exception:
         data = {}
     
+    category = data.get("category", "All Celebrities")
+    forbidden_words = {"alive", "dead", "living", "passed away", "deceased", "died", "killed"}
+    cat_lower = category.lower()
+    if any(word in cat_lower for word in forbidden_words):
+        raise HTTPException(
+            status_code=400, 
+            detail="Category cannot contain words that reveal the status of the people (e.g., alive, dead)."
+        )
+    
     session_id = str(uuid.uuid4())
     session = {
         "score": 0,
