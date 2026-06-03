@@ -3118,7 +3118,11 @@ async def start_session(request: FastAPIRequest):
         data = {}
     
     category = data.get("category", "All Celebrities")
-    forbidden_words = {"alive", "dead", "living", "passed away", "deceased", "died", "killed"}
+    forbidden_words = {
+        "alive", "dead", "living", "passed away", "deceased", "died", "killed",
+        "murder", "suicide", "assassinated", "executed", "late", "departed",
+        "perished", "survive", "surviving", "homicide", "fatal"
+    }
     cat_lower = category.lower()
     if any(word in cat_lower for word in forbidden_words):
         raise HTTPException(
