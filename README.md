@@ -33,9 +33,21 @@ This method runs the FastAPI server directly on your machine.
 4. **Access the Game**:
    Open your browser and navigate to `http://localhost:8000`.
 
+### Run the backend tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
+The integrity suite uses mocked round data, so it does not call Gemini or Wikimedia.
+Before handing a build to user acceptance testing, also start a real survival
+session with the configured API key and verify that the first generated round is
+returned successfully. The mocked suite is not a substitute for this live smoke test.
+
 ---
 
-### ⚙️ 2. Production Deployment (Using Docker/Systemd)
+### ⚙️ 2. Production Deployment (Using systemd)
 
 For a live, persistent deployment, the repository includes templates for Apache and systemd.
 
@@ -72,8 +84,9 @@ The repository includes a production deploy workflow at `.github/workflows/deplo
 It triggers on pushes to `main` and on manual `workflow_dispatch`.
 
 The repository also includes a validation workflow at `.github/workflows/validate.yml`.
-It runs on pull requests targeting `main` and is intended to be the required
-status check for branch protection.
+It runs the backend integrity suite on pull requests targeting `main` and is
+intended to be the required status check for branch protection. Deployments also
+run the suite and verify that production reports the expected Git revision.
 
 Required repository secrets:
 
@@ -84,9 +97,11 @@ Required repository secrets:
 The workflow:
 
 1. checks out the repo
-2. runs `python -m py_compile main.py`
-3. syncs the repo to `/home/ubuntu/alive-or-dead` with `rsync`
-4. runs `deploy/remote_deploy.sh` on the server
+2. installs test dependencies and runs the integrity suite
+3. records the commit revision and checks Python syntax
+4. syncs the repo to `/home/ubuntu/alive-or-dead` with `rsync`
+5. runs `deploy/remote_deploy.sh` on the server
+6. verifies the public status endpoint reports the deployed revision
 
 `deploy/rsync-excludes.txt` defines the files that are intentionally not deployed, including `.env`, local queues/history, audit logs, editor metadata, and the local virtualenv.
 
@@ -103,8 +118,38 @@ The workflow:
 2. **Guessing State**: Gemini selects a subject (e.g., Keanu Reeves), returns themed Tailwind UI plus a `portrait_search_query`, and the backend resolves a live Wikimedia portrait for the user to guess [ALIVE] or [DEAD].
    - With larger global histories, the backend can preselect an unused local candidate and verify status before asking Gemini to build the UI, avoiding repeated rejected candidate-selection calls.
 3. **Dramatic Reveal**: Upon selection, the UI transforms into a themed reveal (celebratory for alive, respectful for dead).
-4. **Session Tracking**: The backend tracks the score over 10 rounds.
-5. **Finale**: After 10 rounds, a final score screen is displayed.
+4. **Session Tracking**: The backend tracks a classic score over 10 rounds or an open-ended survival streak.
+5. **Finale**: Classic mode shows a final score after 10 rounds; survival ends after an incorrect answer or timeout.
+
+## Game integrity and capacity controls
+
+- Guess and next-round transitions are serialized per session; a round can only
+  be scored once and must be answered before the game advances.
+- Survival leaderboard scores are calculated by the backend and can be submitted
+  once per completed session.
+- Session creation is protected by configurable per-client and global limits:
+  `START_SESSION_RATE_LIMIT`, `START_SESSION_RATE_WINDOW_SECONDS`,
+  `MAX_ACTIVE_SESSIONS_PER_CLIENT`, and `MAX_ACTIVE_SESSIONS`.
+- `LEADERBOARD_DB_FILE` can override the default `leaderboard.db` location.
+- `GLOBAL_HISTORY_FILE` can isolate generated-person history during smoke tests.
+- Every candidate must have a verifiable Wikidata birth date and a hypothetical
+  current age no greater than `MAX_PLAUSIBLE_AGE_YEARS` (default: `120`). This
+  server-side rule applies to every preset and custom category.
+- Candidate names must match the canonical Wikipedia person title. Portraits
+  preferentially use Wikidata's image claim for that same verified entity;
+  ambiguous surname-only identities are rejected instead of guessed.
+
+## Gemini availability
+
+Flash-Lite is the default low-cost model and stable Gemini 2.5 Flash is the
+automatic fallback for both foreground generation and background prefetch. The
+app uses exponential backoff when every configured model reports a transient
+429, 5xx, timeout, or capacity error.
+
+Override the ordered fallback lists with comma-separated model IDs in
+`GEMINI_FAST_MODELS` and `GEMINI_BACKGROUND_MODELS`. Backoff timing is
+configurable with `GEMINI_TRANSIENT_RETRY_BASE_SECONDS` and
+`GEMINI_TRANSIENT_RETRY_MAX_SECONDS`.
 
 ## AI System Prompt
 

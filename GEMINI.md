@@ -1,12 +1,12 @@
 # Alive or Dead: Project Context & Roadmap
 
 ## 1. Project Vision
-A high-fidelity Proof of Concept (POC) for a celebrity vital-status guessing game. The game uses AI (Gemini 2.5 Flash family) to autonomously curate challenges and design bespoke UI themes for every round, with portrait image URLs embedded directly in the returned HTML.
+A high-fidelity Proof of Concept (POC) for a celebrity vital-status guessing game. The game uses AI (Gemini 2.5 Flash family) to autonomously curate challenges and design bespoke UI themes for every round, while the backend verifies status and injects resolved Wikimedia portrait URLs.
 
 ## 2. Core Game Rules
 - **The Loop:** 10 rounds per game.
 - **The Choice:** Binary selection: [ALIVE] or [DEAD].
-- **The Subject:** Famous icons born between 1920 and 1980 (ensuring plausible vital status).
+- **The Subject:** Famous people whose age could plausibly fall within a living human lifespan. This eligibility rule applies to every preset and custom category and cannot be overridden by category selection.
 - **The Reveal:** Instant thematic transformation (Celebratory for Alive, Respectful Tribute for Dead) including a fun fact.
 - **Repeat Prevention:** Every selected celebrity is recorded in `global_history.json` and added to a 'Forbidden List' to ensure they never appear again across any session.
 
@@ -27,14 +27,63 @@ A high-fidelity Proof of Concept (POC) for a celebrity vital-status guessing gam
 6. **Portrait Placeholder:** Guessing UIs must include exactly one portrait image using the backend placeholder, and image markup should live inside styled design containers.
 
 ## 5. Roadmap & Future Ideas
-- [ ] **Global Leaderboard:** Track high scores across different users.
+- [x] **Global Leaderboard:** Track backend-verified survival scores across users.
+- [x] **Thematic Collections:** Preset and custom celebrity categories.
+- [x] **Phase 0 Integrity:** Atomic round scoring, strict API validation, session limits, and deterministic regression tests.
+- [ ] **Phase 1 Performance Re-engineering:** Serve deterministic, pre-validated game packs from persistent inventory so live AI generation is removed from normal gameplay latency.
+- [ ] **Daily Challenge:** A shared, seeded challenge with daily rankings.
+- [ ] **Phase 2 Difficulty Levels:** Balanced candidate familiarity and alive/dead distribution, built on Phase 1 inventory metadata.
+- [ ] **Results & Sharing:** Rich game summaries and spoiler-free share cards.
 - [ ] **Multiplayer Mode:** Real-time "guess-off" between two players.
-- [ ] **Thematic Collections:** Specialized games (e.g., "80s Action Stars", "Golden Age Musicians").
 - [ ] **Audio Integration:** AI-generated voiceovers for the dramatic reveals.
 - [ ] **Video Clips:** Integrating short YouTube/Public Domain clips for the tributes.
-- [ ] **Social Sharing:** Dynamically generated "results cards" for sharing on X/Instagram.
 
-## 6. Development Instructions
+## 6. Phase 1 — Performance Re-engineering
+
+### Problem
+The current per-session in-memory prefetch buffer reduces some waits but still performs live Gemini, Wikipedia, Wikidata, portrait-resolution, and validation work when the buffer is empty. A prefetch miss therefore puts variable external-service latency directly between playable rounds.
+
+### Target architecture
+1. **Persistent validated round inventory:** Store complete, approved round payloads and identity metadata in a durable database rather than only in session memory.
+2. **Ready Classic game packs:** Assemble balanced ten-round packs before a player starts. Starting a stocked game reserves one pack atomically and keeps all answers and reveal payloads server-side.
+3. **Survival inventory:** Draw validated rounds from a deep shared pool without invoking Gemini on the request path and without repeating a person within the session.
+4. **Background replenishment:** A separate producer continuously generates, verifies, and refills inventory based on category, status balance, and later difficulty metadata.
+5. **Asset warming:** Preload the next verified portrait in the browser or serve it through a controlled cache so image download does not delay the transition.
+6. **Custom-category preparation:** Prepare and validate a complete game before enabling Start when no stocked pack exists; clearly show preparation progress rather than pausing between rounds.
+7. **Graceful depletion:** Never silently fall back to slow live generation between stocked rounds. Report inventory state and use an explicit preparation flow.
+
+### Delivery sequence
+- Add timing telemetry for start-session, next-round, inventory lookup, and external generation to establish a baseline.
+- Define the persistent round and game-pack schema, lifecycle states, expiry policy, and atomic reservation behavior.
+- Move generation and validation into a restart-safe background worker.
+- Serve Classic and Survival rounds entirely from inventory.
+- Add next-portrait warming without exposing future answers or reveal HTML to the client.
+- Add inventory health reporting, minimum-stock thresholds, and operational refill controls.
+- Run concurrency, restart, depletion, category-isolation, and end-to-end browser tests before rollout.
+
+### Acceptance criteria
+- Stocked Classic game start latency is no more than 2 seconds at p95.
+- Stocked next-round latency is no more than 250 ms at p95, excluding the user's network connection.
+- Stocked start and next-round requests make zero Gemini, Wikipedia, Wikidata, or Commons calls.
+- A complete Classic pack is validated before reservation, and future answers remain server-side.
+- Survival play continues from durable inventory without same-session duplicates.
+- Inventory survives application restarts and concurrent reservations cannot allocate the same pack twice.
+- Empty or custom inventory uses an explicit preparation state and never introduces an unexpected between-round generation wait.
+
+## 7. UAT Findings
+- [x] **UAT-001 — Implausibly old historical figures can be selected (Phase 0 correctness).**
+  - **Observed:** Ancient figures such as Julius Caesar and Cleopatra appeared in generated rounds.
+  - **Requirement:** Every candidate must have a birth date recent enough that the person could plausibly still be alive, regardless of preset or custom category. Category matching must never bypass this constraint.
+  - **Enforcement:** Validate the candidate's date of birth server-side against a configurable maximum plausible age (default: 120 years). Reject candidates with an older or unverifiable birth date before generating a round.
+  - **Acceptance criteria:** Julius Caesar, Cleopatra, and equivalent ancient/historical figures are rejected; a deceased modern figure remains eligible when their age would not exceed the configured limit; automated tests cover both cases and all category paths.
+  - **Resolution:** Closed after successful local Classic-mode UAT with the Historical Figures category.
+- [x] **UAT-002 — Ambiguous names can resolve to the wrong person's portrait.**
+  - **Observed:** A round named `Gandhi` displayed Rahul Gandhi while the copy described Mahatma Gandhi.
+  - **Requirement:** Candidate identity, verified status, and portrait must all resolve to the same canonical person entity.
+  - **Acceptance criteria:** Ambiguous surname-only candidates such as `Gandhi` are rejected; canonical names must match the resolved Wikipedia title; portraits prefer the verified Wikidata entity's image and fuzzy Commons fallback cannot be used for mononyms.
+  - **Resolution:** Closed after successful local portrait-identity UAT on version 3.7.2.
+
+## 8. Development Instructions
 - **Memory Check:** Refer to `.gemini/tmp/brad/memory/MEMORY.md` for technical lessons (e.g., Python f-string syntax rules).
 - **Startup:** Always run `python main.py` from the `alive-or-dead/` directory.
 - **API Key:** Ensure `GEMINI_API_KEY` is present in the `.env` file.

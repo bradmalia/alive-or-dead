@@ -3,6 +3,10 @@
 __pycache__/
 *.pyc
 venv/
+node_modules/
+test-results/
+.deploy-revision
+*.db
 
 gemini_audit.jsonl
 game_queue.json

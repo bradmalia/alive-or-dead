@@ -27,8 +27,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
       - name: Verify application syntax
         run: python -m py_compile main.py
+
+      - name: Run backend integrity tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Record deployment revision
+        run: printf '%s\n' "$GITHUB_SHA" > .deploy-revision
 
       - name: Configure SSH
         env:
@@ -77,9 +86,11 @@ jobs:
           import os
 
           data = json.loads(os.environ["STATUS_JSON"])
+          assert data["revision"] == os.environ["EXPECTED_REVISION"]
           assert data["image_contract"] == "backend_wikimedia_query_resolution"
           assert data["gemini_audit_log_enabled"] is True
           PY
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          EXPECTED_REVISION: ${{ github.sha }}
