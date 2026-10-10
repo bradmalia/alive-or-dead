@@ -31,7 +31,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Verify application syntax
-        run: python -m py_compile main.py
+        run: python -m py_compile main.py inventory.py refill_inventory.py inventory_worker.py tests/test_phase1_inventory.py
 
       - name: Run backend integrity tests
         run: python -m unittest discover -s tests -v
@@ -89,6 +89,9 @@ jobs:
           assert data["revision"] == os.environ["EXPECTED_REVISION"]
           assert data["image_contract"] == "backend_wikimedia_query_resolution"
           assert data["gemini_audit_log_enabled"] is True
+          assert data["inventory"]["schema_version"] >= 4
+          assert "jobs" in data["inventory"]
+          assert "backlog_packs" in data["inventory"]
           PY
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}

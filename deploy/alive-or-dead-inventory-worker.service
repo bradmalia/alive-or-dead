@@ -1,0 +1,16 @@
+[Unit]
+Description=Alive or Dead prepared inventory worker
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/alive-or-dead
+EnvironmentFile=/home/ubuntu/alive-or-dead/.env
+ExecStart=/home/ubuntu/alive-or-dead/venv/bin/python inventory_worker.py --category "All Celebrities" --minimum-packs 2
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -7,7 +7,7 @@ VENV_DIR="${VENV_DIR:-$APP_DIR/venv}"
 
 cd "$APP_DIR"
 
-$PYTHON_BIN -m py_compile main.py
+$PYTHON_BIN -m py_compile main.py inventory.py refill_inventory.py inventory_worker.py
 
 if [ ! -d "$VENV_DIR" ]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
@@ -18,6 +18,7 @@ fi
 
 sudo install -m 644 deploy/alive-or-dead-apache.conf /etc/apache2/conf-available/alive-or-dead.conf
 sudo install -m 644 deploy/alive-or-dead.service /etc/systemd/system/alive-or-dead.service
+sudo install -m 644 deploy/alive-or-dead-inventory-worker.service /etc/systemd/system/alive-or-dead-inventory-worker.service
 sudo install -m 644 deploy/root-index.html /var/www/html/index.html
 
 sudo a2enmod proxy proxy_http headers rewrite ssl >/dev/null
@@ -26,5 +27,8 @@ sudo a2enconf alive-or-dead >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable alive-or-dead >/dev/null
 sudo systemctl restart alive-or-dead
+if sudo systemctl is-enabled --quiet alive-or-dead-inventory-worker; then
+  sudo systemctl restart alive-or-dead-inventory-worker
+fi
 sudo apache2ctl configtest
 sudo systemctl reload apache2

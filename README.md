@@ -65,7 +65,9 @@ For a live, persistent deployment, the repository includes templates for Apache 
     # Assuming you are in the repository root
     bash deploy/remote_deploy.sh
     ```
-3. **Verify Services:** The script handles installing the Apache configuration (`/etc/apache2/conf-available/alive-or-dead.conf`) and the `systemd` service file (`/etc/systemd/system/alive-or-dead.service`).
+3. **Verify Services:** The script installs the Apache configuration, web service,
+   and the optional `alive-or-dead-inventory-worker.service`. The worker is not
+   enabled automatically because it consumes Gemini quota while stocking packs.
 4. **Restart Services:** The script will reload Apache and restart the service to ensure the new code is running.
 
 ---
@@ -73,9 +75,13 @@ For a live, persistent deployment, the repository includes templates for Apache 
 ## 📂 Project Structure
 
 - `main.py`: The FastAPI server containing the game logic and the AI System Prompt.
+- `inventory.py`: SQLite schema and transactional round/game-pack inventory operations.
+- `refill_inventory.py`: Offline producer command for validated Classic game packs.
+- `inventory_worker.py`: Restart-safe minimum-stock worker with leased refill jobs.
 - `requirements.txt`: Python dependencies.
 - `deploy/alive-or-dead-apache.conf`: Apache proxy snippet for `/alive-or-dead/`.
 - `deploy/alive-or-dead.service`: `systemd` unit running Uvicorn on `127.0.0.1:8000`.
+- `deploy/alive-or-dead-inventory-worker.service`: Optional background inventory worker.
 - `deploy/remote_deploy.sh`: Script to automate deployment setup.
 
 ## GitHub Actions deploy
@@ -138,6 +144,68 @@ The workflow:
 - Candidate names must match the canonical Wikipedia person title. Portraits
   preferentially use Wikidata's image claim for that same verified entity;
   ambiguous surname-only identities are rejected instead of guessed.
+
+## Prepared Classic inventory (Phase 1 foundation)
+
+Validated rounds and complete Classic packs share the existing SQLite database
+configured by `LEADERBOARD_DB_FILE`. Inventory is durable across application
+restarts, and reservations use an atomic SQLite write transaction so one pack
+cannot be allocated to two sessions. Abandoned reservations expire and can be
+reclaimed.
+
+Generate one ten-round pack outside the web request path:
+
+```bash
+python refill_inventory.py --category "All Celebrities" --packs 1
+```
+
+Use `--db /path/to/database.db` to stock an isolated database. The command exits
+nonzero if it cannot assemble every requested complete pack. It requires the
+same Gemini and Wikimedia configuration as live round generation.
+
+Run one minimum-stock worker cycle against an isolated database:
+
+```bash
+python inventory_worker.py --once --db /tmp/alive-or-dead-worker.db \
+  --category "All Celebrities" --minimum-packs 2
+```
+
+The worker creates a durable job, leases it to one worker, and records each pack
+against that job. Expired leases are recoverable after process or host restarts,
+and already-created packs are counted before work resumes. Packs default to five
+alive and five dead rounds. Stale loose rounds are reverified; changes to vital
+status, identity, or portrait retire the round, while transient verification
+errors keep it quarantined from new packs. Packs containing stale rounds are
+retired before replenishment. A terminally failed job blocks automatic
+replacement for one hour by default, preventing persistent provider failures
+from turning into an uncontrolled retry/quota loop; override this with
+`--failed-job-cooldown-seconds`.
+
+On the production host, explicitly enable continuous replenishment only when
+Gemini quota usage is intended:
+
+```bash
+sudo systemctl enable --now alive-or-dead-inventory-worker
+sudo systemctl status alive-or-dead-inventory-worker
+```
+
+Serving prepared packs is disabled by default. Set
+`ROUND_INVENTORY_ENABLED=true` only after the desired Classic categories are
+stocked. When enabled, an empty category returns an explicit HTTP 503 preparation
+response and never falls back to live generation. Survival continues to use the
+existing generation/prefetch path in this foundation release.
+
+Operational settings:
+
+- `ROUND_INVENTORY_ENABLED` defaults to `false`.
+- `INVENTORY_RESERVATION_TTL_SECONDS` defaults to two hours.
+- `INVENTORY_MAX_ROUND_AGE_SECONDS` defaults to 24 hours. The web application
+  will not reserve packs containing older validations.
+- `PERF_SAMPLE_SIZE` defaults to 500 samples per measured stage.
+- `/api/status` reports round/pack/job counts, outstanding pack backlog, stale
+  loose rounds, ready packs by category, and rolling p50/p95 latency for
+  start-session, next-round, inventory lookup, and external generation.
+  Timing samples are per process and reset when the process restarts.
 
 ## Gemini availability
 

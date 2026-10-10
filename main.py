@@ -38,6 +38,8 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request as UrlRequest, urlopen
 import socket
 
+import inventory
+
 # Patch socket.getaddrinfo to force IPv4 and prevent AWS IPv6 blackhole timeouts
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -96,6 +98,7 @@ def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS leaderboard_session_id_unique "
             "ON leaderboard(session_id) WHERE session_id IS NOT NULL"
         )
+        inventory.initialize_schema(conn)
 
 init_db()
 
@@ -149,7 +152,7 @@ def app_path(path: str) -> str:
     normalized_path = path if path.startswith("/") else f"/{path}"
     return f"{APP_BASE_PATH}{normalized_path}" if APP_BASE_PATH else normalized_path
 
-APP_VERSION = "3.7.2"
+APP_VERSION = "3.9.0"
 APP_REVISION_FILE = BASE_DIR / ".deploy-revision"
 try:
     _FILE_APP_REVISION = APP_REVISION_FILE.read_text(encoding="utf-8").strip()
@@ -170,6 +173,16 @@ ROUNDS_PER_GAME = 10
 GLOBAL_HISTORY_PROMPT_LIMIT = int(os.getenv("GLOBAL_HISTORY_PROMPT_LIMIT", "50"))
 ROUND_GENERATION_ATTEMPTS = int(os.getenv("ROUND_GENERATION_ATTEMPTS", "3"))
 PREFETCH_ROUND_BUFFER = int(os.getenv("PREFETCH_ROUND_BUFFER", "2"))
+ROUND_INVENTORY_ENABLED = os.getenv("ROUND_INVENTORY_ENABLED", "false").lower() == "true"
+INVENTORY_RESERVATION_TTL_SECONDS = max(
+    60,
+    int(os.getenv("INVENTORY_RESERVATION_TTL_SECONDS", str(60 * 120))),
+)
+INVENTORY_MAX_ROUND_AGE_SECONDS = max(
+    60,
+    int(os.getenv("INVENTORY_MAX_ROUND_AGE_SECONDS", str(60 * 60 * 24))),
+)
+PERF_SAMPLE_SIZE = max(20, int(os.getenv("PERF_SAMPLE_SIZE", "500")))
 CANDIDATE_SELECTION_COUNT = min(
     50,
     max(1, int(os.getenv("CANDIDATE_SELECTION_COUNT", "30"))),
@@ -281,6 +294,9 @@ WIKIMEDIA_THUMB_PREFIXES = (
     "https://upload.wikimedia.org/wikipedia/commons/thumb/",
     "http://upload.wikimedia.org/wikipedia/commons/thumb/",
     "//upload.wikimedia.org/wikipedia/commons/thumb/",
+    "https://thumb.wikimedia.org/wikipedia/commons/thumb/",
+    "http://thumb.wikimedia.org/wikipedia/commons/thumb/",
+    "//thumb.wikimedia.org/wikipedia/commons/thumb/",
 )
 VALID_WIKIMEDIA_THUMB_WIDTHS = {
     "20",
@@ -721,6 +737,52 @@ runtime_state = {
     "last_error": None,
     "last_model": None,
 }
+
+
+class TimingTelemetry:
+    """Bounded, per-process latency samples suitable for release baselines."""
+
+    def __init__(self, max_samples: int) -> None:
+        self.max_samples = max_samples
+        self._samples: dict[str, collections.deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def record(self, stage: str, duration_ms: float) -> None:
+        with self._lock:
+            samples = self._samples.setdefault(
+                stage,
+                collections.deque(maxlen=self.max_samples),
+            )
+            samples.append(round(float(duration_ms), 1))
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        rank = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * percentile + 0.5)))
+        return round(ordered[rank], 1)
+
+    def snapshot(self) -> dict[str, dict[str, float | int]]:
+        with self._lock:
+            captured = {stage: list(values) for stage, values in self._samples.items()}
+        return {
+            stage: {
+                "count": len(values),
+                "p50_ms": self._percentile(values, 0.50),
+                "p95_ms": self._percentile(values, 0.95),
+                "max_ms": round(max(values), 1),
+            }
+            for stage, values in sorted(captured.items())
+            if values
+        }
+
+    def clear(self) -> None:
+        with self._lock:
+            self._samples.clear()
+
+
+timing_telemetry = TimingTelemetry(PERF_SAMPLE_SIZE)
 modern_client = modern_genai.Client(api_key=api_key) if modern_genai and api_key else None
 gemini_audit_log_lock = threading.Lock()
 global_history_lock = threading.Lock()   # guards global_history.json read-modify-write
@@ -840,6 +902,7 @@ def perf_now() -> float:
 
 def log_perf(stage: str, started_at: float, **fields) -> float:
     duration_ms = round((time.perf_counter() - started_at) * 1000, 1)
+    timing_telemetry.record(stage, duration_ms)
     if PERF_LOG_ENABLED:
         payload = {"stage": stage, "duration_ms": duration_ms, **fields}
         logger.info("perf %s", json.dumps(payload, sort_keys=True, default=str))
@@ -1540,11 +1603,17 @@ def fetch_json_url(url: str, timeout_seconds: float, user_agent: str) -> dict:
             raise
 
 
-def validate_image_url_reachable(image_source: str, person_name: str, label: str) -> None:
+def validate_image_url_reachable(
+    image_source: str,
+    person_name: str,
+    label: str,
+    *,
+    use_cache: bool = True,
+) -> None:
     if not IMAGE_URL_VALIDATION_ENABLED:
         return
 
-    cached = image_url_validation_cache.get(image_source)
+    cached = image_url_validation_cache.get(image_source) if use_cache else None
     if cached is not None:
         ok, reason = cached
         if ok:
@@ -1734,9 +1803,13 @@ def get_wikipedia_page_summary(page_key: str) -> dict:
     )
 
 
-def resolve_wikipedia_person_summary(person_name: str) -> tuple[dict, str] | None:
+def resolve_wikipedia_person_summary(
+    person_name: str,
+    *,
+    use_cache: bool = True,
+) -> tuple[dict, str] | None:
     cache_key = normalize_name_key(person_name)
-    cached = wikipedia_person_summary_cache.get(cache_key)
+    cached = wikipedia_person_summary_cache.get(cache_key) if use_cache else None
     if cached is not None:
         ok, value = cached
         if ok and isinstance(value, dict):
@@ -1787,12 +1860,12 @@ def resolve_wikipedia_person_summary(person_name: str) -> tuple[dict, str] | Non
     return None
 
 
-def get_wikidata_entity(entity_id: str) -> dict:
+def get_wikidata_entity(entity_id: str, *, use_cache: bool = True) -> dict:
     normalized_entity_id = entity_id.strip().upper()
     if not re.fullmatch(r"Q\d+", normalized_entity_id):
         raise ValueError(f"Invalid Wikidata entity id: {entity_id}")
 
-    cached = wikidata_entity_cache.get(normalized_entity_id)
+    cached = wikidata_entity_cache.get(normalized_entity_id) if use_cache else None
     if cached is not None:
         ok, value = cached
         if ok and isinstance(value, dict):
@@ -1952,9 +2025,13 @@ def validate_candidate_birth_date(
     return raw_birth_date
 
 
-def verify_person_facts(person_name: str) -> VerifiedPersonFacts:
+def verify_person_facts(
+    person_name: str,
+    *,
+    use_cache: bool = True,
+) -> VerifiedPersonFacts:
     cache_key = normalize_name_key(person_name)
-    cached = status_verification_cache.get(cache_key)
+    cached = status_verification_cache.get(cache_key) if use_cache else None
     if cached is not None:
         ok, value = cached
         if ok and isinstance(value, VerifiedPersonFacts):
@@ -1964,7 +2041,11 @@ def verify_person_facts(person_name: str) -> VerifiedPersonFacts:
 
     started_at = perf_now()
     try:
-        summary_result = resolve_wikipedia_person_summary(person_name)
+        summary_result = (
+            resolve_wikipedia_person_summary(person_name)
+            if use_cache
+            else resolve_wikipedia_person_summary(person_name, use_cache=False)
+        )
         if summary_result is None:
             raise ValueError(f"No matching Wikipedia person page found for {person_name}")
         summary, resolved_title = summary_result
@@ -1972,7 +2053,11 @@ def verify_person_facts(person_name: str) -> VerifiedPersonFacts:
         if not entity_id:
             raise ValueError(f"Wikipedia summary has no Wikidata entity for {person_name}")
 
-        entity = get_wikidata_entity(entity_id)
+        entity = (
+            get_wikidata_entity(entity_id)
+            if use_cache
+            else get_wikidata_entity(entity_id, use_cache=False)
+        )
         if not wikidata_claim_has_entity_value(
             entity,
             WIKIDATA_INSTANCE_OF_PROPERTY,
@@ -3158,12 +3243,29 @@ async def generate_round_payload(
     if session.get("mode", "survival") != "survival" and GLOBAL_HISTORY_PROMPT_LIMIT > 0:
         forbidden.extend(get_global_history()[-GLOBAL_HISTORY_PROMPT_LIMIT:])
     forbidden = merge_names_recency_preserving([], forbidden)
-    model_name, round_data = await asyncio.to_thread(
-        generate_single_round_sync,
-        forbidden,
-        model_candidates,
-        race_models,
-        category=session.get("category", "All Celebrities")
+    generation_started_at = perf_now()
+    try:
+        model_name, round_data = await asyncio.to_thread(
+            generate_single_round_sync,
+            forbidden,
+            model_candidates,
+            race_models,
+            category=session.get("category", "All Celebrities")
+        )
+    except Exception:
+        log_perf(
+            "generation.external",
+            generation_started_at,
+            outcome="error",
+            target_round_number=target_round_number,
+        )
+        raise
+    log_perf(
+        "generation.external",
+        generation_started_at,
+        outcome="success",
+        target_round_number=target_round_number,
+        model=model_name,
     )
     session["used_names"] = merge_names_recency_preserving(
         session.get("used_names", []),
@@ -3243,6 +3345,8 @@ def schedule_prefetch(session_id: str) -> None:
     session = sessions.get(session_id)
     if not session:
         return
+    if session.get("inventory_pack_id") is not None:
+        return
     if session.get("mode") == "classic" and session["round_number"] >= ROUNDS_PER_GAME:
         return
     if len(session.get("queued_rounds", [])) >= PREFETCH_ROUND_BUFFER:
@@ -3257,6 +3361,26 @@ def schedule_prefetch(session_id: str) -> None:
 
 async def get_next_round_for_session(session_id: str, session: dict) -> dict:
     round_lock: asyncio.Lock = session.get("round_lock") or asyncio.Lock()
+
+    if session.get("inventory_pack_id") is not None:
+        inventory_started_at = perf_now()
+        async with round_lock:
+            prepared_rounds = session.get("inventory_rounds", [])
+            if not prepared_rounds:
+                log_perf(
+                    "inventory.lookup",
+                    inventory_started_at,
+                    outcome="depleted_reserved_pack",
+                )
+                raise RuntimeError("The reserved game pack is unexpectedly depleted")
+            round_data = prepared_rounds.pop(0)
+            session["active_round"] = round_data
+            session["used_names"] = merge_names_recency_preserving(
+                session.get("used_names", []),
+                [round_data["person_name"]],
+            )
+        log_perf("inventory.lookup", inventory_started_at, outcome="reserved_round")
+        return round_data
 
     # Fast path: grab from the prefetch queue while holding the lock.
     async with round_lock:
@@ -3307,6 +3431,11 @@ async def _session_cleanup_loop() -> None:
             task = session.get("prefetch_task")
             if task and not task.done():
                 task.cancel()
+            if session.get("inventory_pack_id") is not None:
+                try:
+                    await asyncio.to_thread(inventory.release_pack, DB_PATH, sid)
+                except Exception as exc:
+                    logger.warning("Unable to release expired inventory pack for %s: %s", sid, exc)
         if stale:
             logger.info("Session cleanup: evicted %d stale session(s)", len(stale))
 
@@ -3335,6 +3464,23 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def record_request_timing(request: FastAPIRequest, call_next):
+    stage = {
+        "/api/start-session": "request.start_session",
+        "/api/next-round": "request.next_round",
+        app_path("/api/start-session"): "request.start_session",
+        app_path("/api/next-round"): "request.next_round",
+    }.get(request.url.path)
+    if stage is None:
+        return await call_next(request)
+    started_at = perf_now()
+    try:
+        return await call_next(request)
+    finally:
+        log_perf(stage, started_at, method=request.method)
 
 
 @app.get("/static/{filename}")
@@ -3780,6 +3926,15 @@ async def index():
 
 @app.get("/api/status")
 async def status():
+    try:
+        inventory_status = await asyncio.to_thread(
+            inventory.inventory_health,
+            DB_PATH,
+            max_round_age_seconds=INVENTORY_MAX_ROUND_AGE_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning("Unable to read inventory health: %s", exc)
+        inventory_status = {"error": "unavailable"}
     return {
         "app_version": APP_VERSION,
         "revision": APP_REVISION,
@@ -3796,6 +3951,14 @@ async def status():
         "fast_model_candidates": FAST_MODEL_CANDIDATES,
         "background_model_candidates": BACKGROUND_MODEL_CANDIDATES,
         "image_contract": "backend_wikimedia_query_resolution",
+        "round_inventory_enabled": ROUND_INVENTORY_ENABLED,
+        "inventory_max_round_age_seconds": INVENTORY_MAX_ROUND_AGE_SECONDS,
+        "inventory": inventory_status,
+        "performance": {
+            "scope": "per_process_rolling_window",
+            "sample_size": PERF_SAMPLE_SIZE,
+            "timings": timing_telemetry.snapshot(),
+        },
     }
 
 
@@ -3833,6 +3996,8 @@ async def start_session(payload: StartSessionRequest, request: FastAPIRequest):
         "queued_rounds": [],
         "prefetch_task": None,
         "prefetch_error": None,
+        "inventory_pack_id": None,
+        "inventory_rounds": [],
         "created_at": now,
         "last_activity": now,
         "round_lock": asyncio.Lock(),
@@ -3846,15 +4011,62 @@ async def start_session(payload: StartSessionRequest, request: FastAPIRequest):
     sessions[session_id] = session
 
     try:
-        round_data = await generate_round_for_session(
-            session,
-            1,
-            FAST_MODEL_CANDIDATES,
-            RACE_FAST_MODELS,
-        )
+        if ROUND_INVENTORY_ENABLED and payload.mode == "classic":
+            inventory_started_at = perf_now()
+            prepared_pack = await asyncio.to_thread(
+                inventory.reserve_classic_pack,
+                DB_PATH,
+                payload.category,
+                session_id,
+                round_count=ROUNDS_PER_GAME,
+                reservation_ttl_seconds=INVENTORY_RESERVATION_TTL_SECONDS,
+                max_round_age_seconds=INVENTORY_MAX_ROUND_AGE_SECONDS,
+            )
+            log_perf(
+                "inventory.lookup",
+                inventory_started_at,
+                outcome="reserved_pack" if prepared_pack else "empty",
+                category=payload.category,
+            )
+            if prepared_pack is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "No prepared Classic game is available for this category. "
+                        "Please try again after inventory is replenished."
+                    ),
+                    headers={"Retry-After": "60"},
+                )
+            session["inventory_pack_id"] = prepared_pack["pack_id"]
+            prepared_rounds = list(prepared_pack["rounds"])
+            if len(prepared_rounds) != ROUNDS_PER_GAME:
+                raise RuntimeError("Reserved Classic pack has an invalid round count")
+            round_data = prepared_rounds.pop(0)
+            session["inventory_rounds"] = prepared_rounds
+            session["active_round"] = round_data
+            session["used_names"] = [round_data["person_name"]]
+            runtime_state["last_model"] = "prepared_inventory"
+            runtime_state["last_error"] = None
+        else:
+            round_data = await generate_round_for_session(
+                session,
+                1,
+                FAST_MODEL_CANDIDATES,
+                RACE_FAST_MODELS,
+            )
+    except HTTPException:
+        sessions.pop(session_id, None)
+        if session.get("inventory_pack_id") is not None:
+            await asyncio.to_thread(inventory.release_pack, DB_PATH, session_id)
+        raise
     except Exception as exc:
         runtime_state["last_error"] = str(exc)
         sessions.pop(session_id, None)
+        if session.get("inventory_pack_id") is not None:
+            try:
+                await asyncio.to_thread(inventory.release_pack, DB_PATH, session_id)
+            except Exception as release_exc:
+                logger.warning("Unable to release failed inventory reservation: %s", release_exc)
         logger.error("start_session generation failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=503,
@@ -3903,6 +4115,18 @@ async def next_round(session_id: str):
         if session.get("mode") == "classic" and session["round_number"] >= ROUNDS_PER_GAME:
             session["round_state"] = "complete"
             session["last_activity"] = time.monotonic()
+            if session.get("inventory_pack_id") is not None:
+                try:
+                    consumed = await asyncio.to_thread(
+                        inventory.consume_pack,
+                        DB_PATH,
+                        session_id,
+                    )
+                    if not consumed:
+                        logger.warning("Reserved inventory pack was not consumable for %s", session_id)
+                except Exception as exc:
+                    runtime_state["last_error"] = str(exc)
+                    logger.error("Unable to mark inventory pack consumed for %s: %s", session_id, exc)
             return {"status": "finale", "finale_html": render_finale_html(session)}
         session["round_state"] = "loading_next_round"
         session["last_activity"] = time.monotonic()

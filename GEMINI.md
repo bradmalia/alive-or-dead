@@ -53,12 +53,13 @@ The current per-session in-memory prefetch buffer reduces some waits but still p
 7. **Graceful depletion:** Never silently fall back to slow live generation between stocked rounds. Report inventory state and use an explicit preparation flow.
 
 ### Delivery sequence
-- Add timing telemetry for start-session, next-round, inventory lookup, and external generation to establish a baseline.
-- Define the persistent round and game-pack schema, lifecycle states, expiry policy, and atomic reservation behavior.
-- Move generation and validation into a restart-safe background worker.
+- [x] Add timing telemetry for start-session, next-round, inventory lookup, and external generation to establish a baseline.
+- [x] Define the persistent round and game-pack schema, lifecycle states, expiry policy, and atomic reservation behavior.
+- [x] Add an offline validated-round refill command and feature-flagged Classic pack serving with explicit depletion behavior.
+- [x] Move generation and validation into a restart-safe background worker.
 - Serve Classic and Survival rounds entirely from inventory.
 - Add next-portrait warming without exposing future answers or reveal HTML to the client.
-- Add inventory health reporting, minimum-stock thresholds, and operational refill controls.
+- [x] Add inventory health reporting, minimum-stock thresholds, and operational refill controls.
 - Run concurrency, restart, depletion, category-isolation, and end-to-end browser tests before rollout.
 
 ### Acceptance criteria

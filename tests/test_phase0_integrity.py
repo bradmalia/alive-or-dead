@@ -581,6 +581,58 @@ class PhaseZeroIntegrityTests(unittest.TestCase):
             "wikidata_entity_image",
         )
 
+    def test_portrait_accepts_thumb_wikimedia_domain(self) -> None:
+        person_name = "Thumb Domain Person"
+        expected_url = (
+            "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/"
+            "Thumb_Portrait.jpg/500px-Thumb_Portrait.jpg"
+        )
+        facts = main.VerifiedPersonFacts(
+            actual_status="alive",
+            birth_date="+1985-01-01T00:00:00Z",
+            wikipedia_title=person_name,
+            wikidata_entity_id="Q900005",
+        )
+        entity = wikidata_person_entity("+1985-01-01T00:00:00Z")
+        entity["claims"][main.WIKIDATA_IMAGE_PROPERTY] = [
+            wikidata_string_claim("Thumb_Portrait.jpg")
+        ]
+        commons_page = {
+            "title": "File:Thumb_Portrait.jpg",
+            "imageinfo": [
+                {
+                    "thumburl": expected_url,
+                    "thumbmime": "image/jpeg",
+                }
+            ],
+        }
+
+        with (
+            patch.object(main, "verify_person_facts", return_value=facts),
+            patch.object(main, "get_wikidata_entity", return_value=entity),
+            patch.object(
+                main,
+                "get_wikimedia_commons_file_candidate",
+                return_value=commons_page,
+            ),
+            patch.object(main, "validate_image_url_reachable"),
+            patch.object(main, "append_gemini_audit_log") as audit,
+            patch.object(main, "resolve_wikipedia_page_portrait_url") as wikipedia,
+            patch.object(main, "search_wikimedia_commons_candidates") as fuzzy_search,
+        ):
+            result = main.resolve_wikimedia_portrait_url(
+                person_name,
+                "Thumb Domain Person headshot 2015",
+            )
+
+        self.assertEqual(result, expected_url)
+        wikipedia.assert_not_called()
+        fuzzy_search.assert_not_called()
+        self.assertEqual(
+            audit.call_args.kwargs["resolved_from_query"],
+            "wikidata_entity_image",
+        )
+
     def test_mononym_does_not_use_fuzzy_commons_portrait_search(self) -> None:
         person_name = "Regmononym"
         facts = main.VerifiedPersonFacts(
