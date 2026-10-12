@@ -3587,25 +3587,27 @@ async def index():
 
         <!-- Leaderboard Modal -->
         <div id="leaderboard-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div class="w-full max-w-lg rounded-3xl border border-white/10 bg-zinc-900 p-8 shadow-2xl">
-                <h2 id="lb-title" class="text-3xl font-black uppercase text-white mb-6 text-center">Global Leaderboard</h2>
-                
-                <div id="lb-submit-section" class="hidden mb-8 border-b border-white/10 pb-8 text-center">
-                    <p class="text-rose-400 font-bold uppercase tracking-widest text-sm mb-2">Game Over</p>
-                    <p class="text-5xl font-black text-amber-300 mb-4" id="lb-score-display">12</p>
-                    <p class="text-zinc-400 mb-4">Enter 3 initials to save your survival streak!</p>
-                    <div class="flex justify-center gap-2">
-                        <input type="text" id="lb-initials" maxlength="3" class="w-24 text-center rounded-lg border border-white/20 bg-black py-3 text-2xl font-black text-white uppercase outline-none focus:border-amber-400">
-                        <button onclick="submitScore()" class="rounded-lg bg-amber-500 px-6 font-bold uppercase text-black hover:bg-amber-400">Submit</button>
+            <div class="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col rounded-3xl border border-white/10 bg-zinc-900 shadow-2xl">
+                <div class="flex-1 overflow-y-auto overscroll-contain p-8">
+                    <h2 id="lb-title" class="text-3xl font-black uppercase text-white mb-6 text-center">Global Leaderboard</h2>
+                    
+                    <div id="lb-submit-section" class="hidden mb-8 border-b border-white/10 pb-8 text-center">
+                        <p class="text-rose-400 font-bold uppercase tracking-widest text-sm mb-2">Game Over</p>
+                        <p class="text-5xl font-black text-amber-300 mb-4" id="lb-score-display">12</p>
+                        <p class="text-zinc-400 mb-4">Enter 3 initials to save your survival streak!</p>
+                        <div class="flex justify-center gap-2">
+                            <input type="text" id="lb-initials" maxlength="3" class="w-24 text-center rounded-lg border border-white/20 bg-black py-3 text-2xl font-black text-white uppercase outline-none focus:border-amber-400">
+                            <button onclick="submitScore()" class="rounded-lg bg-amber-500 px-6 font-bold uppercase text-black hover:bg-amber-400">Submit</button>
+                        </div>
+                        <p id="lb-submit-error" class="mt-3 hidden text-sm font-bold text-rose-400"></p>
                     </div>
-                    <p id="lb-submit-error" class="mt-3 hidden text-sm font-bold text-rose-400"></p>
+
+                    <div id="lb-list" class="flex flex-col gap-3">
+                        <p class="text-center text-zinc-500">Loading scores...</p>
+                    </div>
                 </div>
 
-                <div id="lb-list" class="flex flex-col gap-3">
-                    <p class="text-center text-zinc-500">Loading scores...</p>
-                </div>
-
-                <div class="mt-8 text-center">
+                <div class="border-t border-white/10 p-4 text-center">
                     <button onclick="closeLeaderboard()" class="rounded-full border border-white/20 px-8 py-3 text-sm font-bold uppercase tracking-widest text-white hover:bg-white/10">Close</button>
                 </div>
             </div>
@@ -3668,6 +3670,7 @@ async def index():
             }}
 
             async function showLeaderboard(finalScore = null) {{
+                document.body.style.overflow = 'hidden';
                 document.getElementById('leaderboard-modal').classList.remove('hidden');
                 document.getElementById('leaderboard-modal').classList.add('flex');
                 
@@ -3694,6 +3697,7 @@ async def index():
             }}
 
             function closeLeaderboard() {{
+                document.body.style.overflow = '';
                 document.getElementById('leaderboard-modal').classList.add('hidden');
                 document.getElementById('leaderboard-modal').classList.remove('flex');
                 if (typeof isGameOver !== 'undefined' && isGameOver) {{
